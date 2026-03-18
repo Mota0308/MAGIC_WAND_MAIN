@@ -1,0 +1,3 @@
+## Magic Wand ESP32-S3 - requires TensorFlow Lite Micro
+dependencies:
+  espressif/esp-tflite-micro: "*"
