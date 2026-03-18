@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Magic Wand — 文字 AI 機器人</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --accent: #3d8bfd;
+      --text: #e6edf3;
+      --muted: #8b949e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.25rem; }
+    .card {
+      width: 100%;
+      max-width: 560px;
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 1rem;
+      border: 1px solid #30363d;
+    }
+    #log {
+      height: 320px;
+      overflow-y: auto;
+      padding: 0.75rem;
+      background: #0d1117;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .msg-user { color: #79c0ff; margin: 0.5rem 0; }
+    .msg-ai { color: #7ee787; margin: 0.5rem 0; white-space: pre-wrap; word-break: break-word; }
+    .msg-sys { color: var(--muted); font-size: 0.8rem; margin: 0.35rem 0; }
+    .row { display: flex; gap: 0.5rem; }
+    input[type="text"] {
+      flex: 1;
+      padding: 0.65rem 0.85rem;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      background: #0d1117;
+      color: var(--text);
+      font-size: 1rem;
+    }
+    input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+    button {
+      padding: 0.65rem 1.1rem;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <h1>文字 AI 機器人</h1>
+  <p class="sub">輸入後送出 → 雲端運算（OpenAI 或模擬模式）→ 顯示回覆。裝置 ID：<input id="did" type="text" value="web_user" style="width:120px;padding:4px 8px;font-size:0.85rem;" /></p>
+  <div class="card">
+    <div id="log"></div>
+    <form class="row" id="f">
+      <input type="text" id="q" placeholder="輸入訊息…" autocomplete="off" />
+      <button type="submit" id="btn">送出</button>
+    </form>
+  </div>
+  <p class="sub" style="margin-top:1rem;"><a href="/">← API 說明</a> · <a href="/api/health">健康檢查</a></p>
+  <script>
+    const log = document.getElementById('log');
+    const q = document.getElementById('q');
+    const btn = document.getElementById('btn');
+    const did = document.getElementById('did');
+
+    function add(cls, text) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.textContent = text;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    document.getElementById('f').onsubmit = async (e) => {
+      e.preventDefault();
+      const text = q.value.trim();
+      if (!text) return;
+      q.value = '';
+      add('msg-user', '你：' + text);
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, device_id: did.value.trim() || 'web_user' }),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          add('msg-ai', 'AI：' + j.reply);
+          add('msg-sys', '模式：' + (j.mode || '?'));
+        } else {
+          add('msg-sys', '錯誤：' + (j.error || r.status) + (j.hint ? ' — ' + j.hint : ''));
+        }
+      } catch (err) {
+        add('msg-sys', '網路錯誤：' + err.message);
+      }
+      btn.disabled = false;
+      q.focus();
+    };
+    add('msg-sys', '就緒。若僅顯示「模擬模式」，請在 Railway 設定 OPENAI_API_KEY。');
+    q.focus();
+  </script>
+</body>
+</html>

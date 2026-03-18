@@ -10,6 +10,15 @@
 |------|------|------|
 | `MONGODB_URI` | ✅ | MongoDB Atlas 連線字串（從 Atlas 複製，勿寫進程式碼） |
 | `MONGODB_DB` | 選填 | 資料庫名稱，不設則使用 **magic_wand** |
+| `OPENAI_API_KEY` | 選填 | 設定後 **`/api/chat`** 使用真實 AI；未設則模擬回覆 |
+| `OPENAI_MODEL` | 選填 | 預設 `gpt-4o-mini` |
+
+## 文字 AI 機器人（無小智）
+
+- **GET `/chat`** — 瀏覽器聊天頁
+- **POST `/api/chat`** — JSON `{"message":"你好","device_id":"可選"}` → `reply`、`mode`
+
+詳見專案根目錄 **`TEXT_AI_ROBOT.md`**。
 
 ## 本機測試
 
@@ -26,8 +35,10 @@ python app.py
 ## API
 
 - **GET /** — 說明
+- **GET /chat** — 文字 AI 聊天頁
 - **GET /api/health** — 健康檢查（含 MongoDB 連線狀態）
 - **POST /api/data** — ESP32 上傳資料，見下方 JSON 格式
+- **POST /api/chat** — 文字 AI（見上）
 
 ## ESP32 POST 的 JSON 格式
 

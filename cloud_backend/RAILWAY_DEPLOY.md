@@ -86,3 +86,17 @@
 3. 在 Compass 的 **magic_wand.device_readings** 裡應能看到一筆新文件。
 
 完成以上步驟後，Railway 上的後端就會接上你的 MongoDB 雲端 URL，並使用 **magic_wand** 資料庫。
+
+---
+
+## 若出現「Application failed to respond」
+
+1. **埠號一致**  
+   Networking 裡若填 **5000**，請在 **Variables** 新增 **`PORT`** = **`5000`**（與對外埠相同），儲存後重新部署。  
+   Gunicorn 會聽 `$PORT`，若 Railway 預設是 8080、你卻把網域指到 5000，就會連不上。
+
+2. **看 Deploy Logs**  
+   Service → **Deployments** → 點最新一次 → **View Logs**，看是否有 Python 錯誤或 `MongoDB`。
+
+3. **程式已更新**  
+   新版 `app.py` 在 MongoDB 連不上時仍會啟動網站（`/api/health` 可開），請把更新後的 `cloud_backend` **push 到 GitHub** 讓 Railway 重新部署。
