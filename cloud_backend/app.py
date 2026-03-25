@@ -153,6 +153,39 @@ def _openai_chat(user_text: str) -> str:
         data = json_lib.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"].strip()
 
+def _poe_chat(user_text: str) -> str:
+    """呼叫 Poe Chat Completions（OpenAI-compatible）；失敗時拋出例外。"""
+    key = os.environ.get("POE_API_KEY", "").strip()
+    if not key:
+        raise ValueError("POE_API_KEY not set")
+    # Poe uses bot names as model id. You may need to change this in Railway variables.
+    model = os.environ.get("POE_MODEL", "gpt-4o-mini")
+    payload = json_lib.dumps(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是簡短、友善的助手，用繁體中文回答，盡量精簡。",
+                },
+                {"role": "user", "content": user_text[:8000]},
+            ],
+            "stream": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.poe.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"].strip()
+
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -174,15 +207,26 @@ def chat():
     mode = "mock"
 
     try:
-        if os.environ.get("OPENAI_API_KEY", "").strip():
+        provider = os.environ.get("AI_PROVIDER", "").strip().lower()
+        if not provider:
+            # Backward-compatible default: prefer OpenAI if configured; else Poe.
+            if os.environ.get("OPENAI_API_KEY", "").strip():
+                provider = "openai"
+            elif os.environ.get("POE_API_KEY", "").strip():
+                provider = "poe"
+
+        if provider == "openai":
             reply = _openai_chat(msg)
             mode = "openai"
+        elif provider == "poe":
+            reply = _poe_chat(msg)
+            mode = "poe"
     except Exception as e:
         return jsonify(
             {
                 "ok": False,
                 "error": str(e),
-                "hint": "檢查 OPENAI_API_KEY 與 Railway 網路是否可連 api.openai.com",
+                "hint": "檢查 AI_PROVIDER、OPENAI_API_KEY/POE_API_KEY、以及 Railway 是否可連外（api.openai.com / api.poe.com）",
             }
         ), 502
 

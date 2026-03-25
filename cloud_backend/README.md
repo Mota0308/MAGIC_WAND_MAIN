@@ -10,8 +10,11 @@
 |------|------|------|
 | `MONGODB_URI` | ✅ | MongoDB Atlas 連線字串（從 Atlas 複製，勿寫進程式碼） |
 | `MONGODB_DB` | 選填 | 資料庫名稱，不設則使用 **magic_wand** |
-| `OPENAI_API_KEY` | 選填 | 設定後 **`/api/chat`** 使用真實 AI；未設則模擬回覆 |
-| `OPENAI_MODEL` | 選填 | 預設 `gpt-4o-mini` |
+| `AI_PROVIDER` | 選填 | `openai` 或 `poe`；不設則優先用 OpenAI（若有 key），否則用 Poe |
+| `OPENAI_API_KEY` | 選填 | `AI_PROVIDER=openai` 時使用 |
+| `OPENAI_MODEL` | 選填 | `AI_PROVIDER=openai` 時使用；預設 `gpt-4o-mini` |
+| `POE_API_KEY` | 選填 | `AI_PROVIDER=poe` 時使用（請勿貼在聊天/上傳 GitHub） |
+| `POE_MODEL` | 選填 | `AI_PROVIDER=poe` 時使用；Poe 使用 bot 名稱，預設 `gpt-4o-mini`（可依 Poe 調整） |
 
 ## 文字 AI 機器人（無小智）
 
