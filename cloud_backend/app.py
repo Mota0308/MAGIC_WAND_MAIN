@@ -12,6 +12,7 @@ import urllib.request
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
+from urllib.parse import urlencode, quote
 
 app = Flask(__name__)
 
@@ -305,11 +306,51 @@ def tts():
         return jsonify({"ok": False, "error": "text is empty"}), 400
 
     try:
-        url = _poe_tts_url(text)
+        upstream_url = _poe_tts_url(text)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
-    return jsonify({"ok": True, "url": url, "provider": "poe"}), 200
+    # Some PoeCDN URLs deny direct browser/IoT downloads. Provide a proxy URL hosted by this backend.
+    proxy_url = "/api/tts/audio?" + urlencode({"u": upstream_url})
+    return jsonify({
+        "ok": True,
+        "provider": "poe",
+        "upstream_url": upstream_url,
+        "url": proxy_url,
+        "note": "Use `url` to download audio via this backend (proxy).",
+    }), 200
+
+
+@app.route("/api/tts/audio", methods=["GET"])
+def tts_audio():
+    """
+    Proxy audio download to bypass upstream access restrictions.
+    Query: ?u=<upstream_url>
+    Returns: audio bytes with Content-Type forwarded when possible.
+    """
+    upstream_url = (request.args.get("u") or "").strip()
+    if not upstream_url.startswith("http"):
+        return jsonify({"ok": False, "error": "Missing or invalid `u`"}), 400
+
+    try:
+        # Some CDNs require a User-Agent header.
+        req = urllib.request.Request(
+            upstream_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            content_type = resp.headers.get("Content-Type") or "application/octet-stream"
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        return jsonify({"ok": False, "error": f"Upstream HTTP {e.code}"}), 502
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    return (data, 200, {"Content-Type": content_type, "Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":
