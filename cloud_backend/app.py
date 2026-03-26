@@ -17,8 +17,11 @@ from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
 from urllib.parse import urlencode
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+# Trust Railway/Proxy headers so request.host_url uses https.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # In-memory short link store: id -> (upstream_url, created_ts)
 # Good enough for testing; redeploy will clear it.
