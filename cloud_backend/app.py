@@ -52,6 +52,7 @@ def index():
         "service": "ESP32 + MongoDB API",
         "endpoints": {
             "GET /chat": "瀏覽器文字 AI 聊天頁",
+            "POST /api/tts": "文字 → 語音（Poe TTS：回傳音檔 URL）",
             "POST /api/data": "上傳裝置資料（AI 結果等）",
             "POST /api/chat": "文字 → 雲端 AI 回覆（OPENAI_API_KEY 或模擬模式）",
             "GET /api/health": "健康檢查",
@@ -186,6 +187,38 @@ def _poe_chat(user_text: str) -> str:
         data = json_lib.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"].strip()
 
+def _poe_tts_url(text: str) -> str:
+    """呼叫 Poe TTS，回傳音檔 URL（目前已驗證 message.content 會是 URL）。"""
+    key = os.environ.get("POE_API_KEY", "").strip()
+    if not key:
+        raise ValueError("POE_API_KEY not set")
+    model = os.environ.get("POE_TTS_MODEL", "Gemini-2.5-Pro-TTS")
+    payload = json_lib.dumps(
+        {
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "請把使用者輸入轉成自然語音輸出。"},
+                {"role": "user", "content": text[:2000]},
+            ],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.poe.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    url = data["choices"][0]["message"]["content"]
+    if not isinstance(url, str) or not url.startswith("http"):
+        raise ValueError("Poe TTS did not return an audio URL in message.content")
+    return url.strip()
+
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -256,6 +289,27 @@ def chat():
             pass
 
     return jsonify({"ok": True, "reply": reply, "mode": mode}), 200
+
+
+@app.route("/api/tts", methods=["POST"])
+def tts():
+    """
+    文字轉語音：回傳可下載的音檔 URL。
+    JSON: { "text": "你好", "device_id": "optional" }
+    """
+    body = request.get_json(force=True, silent=True)
+    if not body:
+        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+    text = (body.get("text") or body.get("message") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "text is empty"}), 400
+
+    try:
+        url = _poe_tts_url(text)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    return jsonify({"ok": True, "url": url, "provider": "poe"}), 200
 
 
 if __name__ == "__main__":
