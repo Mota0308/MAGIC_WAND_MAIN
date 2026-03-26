@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 import time
 import secrets
+import base64
+import io
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
@@ -61,6 +63,7 @@ def index():
         "endpoints": {
             "GET /chat": "瀏覽器文字 AI 聊天頁",
             "POST /api/tts": "文字 → 語音（Poe TTS：回傳音檔 URL）",
+            "POST /api/stt": "語音（WAV）→ 文字（OpenAI STT）",
             "POST /api/data": "上傳裝置資料（AI 結果等）",
             "POST /api/chat": "文字 → 雲端 AI 回覆（OPENAI_API_KEY 或模擬模式）",
             "GET /api/health": "健康檢查",
@@ -227,6 +230,108 @@ def _poe_tts_url(text: str) -> str:
         raise ValueError("Poe TTS did not return an audio URL in message.content")
     return url.strip()
 
+def _encode_multipart_form(fields, files):
+    """
+    Minimal multipart/form-data encoder for urllib.
+    fields: list of (name, value_str)
+    files: list of (name, filename, content_type, bytes)
+    """
+    boundary = "----MagicWandBoundary" + secrets.token_hex(12)
+    crlf = "\r\n"
+    body = bytearray()
+
+    for name, value in fields:
+        body.extend(("--" + boundary + crlf).encode("utf-8"))
+        body.extend((f'Content-Disposition: form-data; name="{name}"' + crlf + crlf).encode("utf-8"))
+        body.extend((str(value) + crlf).encode("utf-8"))
+
+    for name, filename, content_type, data in files:
+        body.extend(("--" + boundary + crlf).encode("utf-8"))
+        body.extend((f'Content-Disposition: form-data; name="{name}"; filename="{filename}"' + crlf).encode("utf-8"))
+        body.extend((f"Content-Type: {content_type}" + crlf + crlf).encode("utf-8"))
+        body.extend(data)
+        body.extend(crlf.encode("utf-8"))
+
+    body.extend(("--" + boundary + "--" + crlf).encode("utf-8"))
+    return boundary, bytes(body)
+
+
+def _openai_stt_wav(wav_bytes: bytes) -> str:
+    """Call OpenAI audio transcriptions API with a WAV file; return text."""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise ValueError("OPENAI_API_KEY not set")
+
+    model = os.environ.get("OPENAI_STT_MODEL", "whisper-1").strip() or "whisper-1"
+    language = os.environ.get("OPENAI_STT_LANGUAGE", "").strip()  # optional: "zh"
+
+    fields = [("model", model)]
+    if language:
+        fields.append(("language", language))
+    # "response_format": "json" is default
+    boundary, body = _encode_multipart_form(
+        fields=fields,
+        files=[("file", "audio.wav", "audio/wav", wav_bytes)],
+    )
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise ValueError("STT returned empty text")
+    return text
+
+def _poe_stt_wav(wav_bytes: bytes) -> str:
+    """
+    Call Poe bot (e.g. Whisper-V3-Large-T) via fastapi-poe with file upload.
+    Returns transcript text.
+    """
+    key = os.environ.get("POE_API_KEY", "").strip()
+    if not key:
+        raise ValueError("POE_API_KEY not set")
+
+    # Poe bot name as used in Poe UI (public bots only)
+    bot = os.environ.get("POE_STT_MODEL", "Whisper-V3-Large-T").strip() or "Whisper-V3-Large-T"
+
+    try:
+        import fastapi_poe as fp
+    except Exception as e:
+        raise RuntimeError("fastapi-poe is not installed") from e
+
+    # Upload WAV as an attachment
+    f = io.BytesIO(wav_bytes)
+    f.name = "audio.wav"  # some libs expect a name attribute
+    att = fp.upload_file_sync(f, api_key=key)
+
+    msg = fp.ProtocolMessage(
+        role="user",
+        content="請把這段音訊轉成文字，只輸出轉寫結果，不要加其他說明。",
+        attachments=[att],
+    )
+
+    parts = []
+    for partial in fp.get_bot_response_sync(messages=[msg], bot_name=bot, api_key=key):
+        if isinstance(partial, str):
+            parts.append(partial)
+        else:
+            # Best-effort: some versions may yield objects with .text
+            t = getattr(partial, "text", None)
+            if isinstance(t, str):
+                parts.append(t)
+    text = "".join(parts).strip()
+    if not text:
+        raise ValueError("Poe STT returned empty text")
+    return text
+
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -331,6 +436,50 @@ def tts():
         "absolute_url": absolute_proxy_url,
         "note": "Use `absolute_url` for ESP32 playback (short proxy).",
     }), 200
+
+
+@app.route("/api/stt", methods=["POST"])
+def stt():
+    """
+    Speech-to-text (WAV -> text).
+
+    Accepts:
+    - Raw WAV bytes with Content-Type: audio/wav (recommended for ESP32)
+    - JSON: { "wav_base64": "...", "device_id": "optional" }
+    """
+    wav_bytes = b""
+    ct = (request.headers.get("Content-Type") or "").lower()
+    if ct.startswith("audio/"):
+        wav_bytes = request.data or b""
+    else:
+        body = request.get_json(force=True, silent=True) or {}
+        b64 = (body.get("wav_base64") or "").strip()
+        if b64:
+            try:
+                wav_bytes = base64.b64decode(b64, validate=True)
+            except Exception:
+                return jsonify({"ok": False, "error": "Invalid wav_base64"}), 400
+
+    if not wav_bytes or len(wav_bytes) < 44:
+        return jsonify({"ok": False, "error": "Missing WAV audio"}), 400
+
+    try:
+        # Prefer Poe STT if configured; else fall back to OpenAI STT.
+        if os.environ.get("POE_API_KEY", "").strip():
+            text = _poe_stt_wav(wav_bytes)
+            mode = "poe"
+        else:
+            text = _openai_stt_wav(wav_bytes)
+            mode = "openai"
+    except Exception as e:
+        # No key or upstream error -> mock (keeps the pipeline testable)
+        text = "[模擬STT] 已收到音訊（bytes=%d）。請在 Railway 設定 OPENAI_API_KEY 以啟用真實語音辨識。" % len(wav_bytes)
+        mode = "mock"
+        # If key exists but call fails, return 502 with reason.
+        if os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("POE_API_KEY", "").strip():
+            return jsonify({"ok": False, "error": str(e)}), 502
+
+    return jsonify({"ok": True, "text": text, "mode": mode}), 200
 
 
 def _tts_cache_get(token: str):

@@ -15,6 +15,10 @@
 | `OPENAI_MODEL` | 選填 | `AI_PROVIDER=openai` 時使用；預設 `gpt-4o-mini` |
 | `POE_API_KEY` | 選填 | `AI_PROVIDER=poe` 時使用（請勿貼在聊天/上傳 GitHub） |
 | `POE_MODEL` | 選填 | `AI_PROVIDER=poe` 時使用；Poe 使用 bot 名稱，預設 `gpt-4o-mini`（可依 Poe 調整） |
+| `POE_TTS_MODEL` | 選填 | `/api/tts` 使用；預設 `Gemini-2.5-Pro-TTS` |
+| `POE_STT_MODEL` | 選填 | `/api/stt` 使用；預設 `Whisper-V3-Large-T` |
+| `OPENAI_STT_MODEL` | 選填 | 當未設定 `POE_API_KEY` 時 `/api/stt` 使用；預設 `whisper-1` |
+| `OPENAI_STT_LANGUAGE` | 選填 | STT 語言提示（例如 `zh`） |
 
 ## 文字 AI 機器人（無小智）
 
@@ -42,6 +46,8 @@ python app.py
 - **GET /api/health** — 健康檢查（含 MongoDB 連線狀態）
 - **POST /api/data** — ESP32 上傳資料，見下方 JSON 格式
 - **POST /api/chat** — 文字 AI（見上）
+- **POST /api/tts** — 文字 → 語音（回傳 `absolute_url`，ESP32 可直接下載播放）
+- **POST /api/stt** — 語音（WAV）→ 文字（優先 Poe；否則 OpenAI；無 key 則 mock）
 
 ## ESP32 POST 的 JSON 格式
 
