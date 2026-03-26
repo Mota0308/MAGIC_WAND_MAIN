@@ -9,12 +9,19 @@ import json as json_lib
 import os
 import urllib.error
 import urllib.request
+import time
+import secrets
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
 app = Flask(__name__)
+
+# In-memory short link store: id -> (upstream_url, created_ts)
+# Good enough for testing; redeploy will clear it.
+_tts_cache = {}
+_tts_cache_ttl_sec = 15 * 60
 
 # MongoDB 連線（Railway 後台設 MONGODB_URI；資料庫預設 magic_wand）
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
@@ -310,27 +317,43 @@ def tts():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 502
 
-    # Some PoeCDN URLs deny direct browser/IoT downloads. Provide a proxy URL hosted by this backend.
-    proxy_url = "/api/tts/audio?" + urlencode({"u": upstream_url})
+    # Some PoeCDN URLs deny direct browser/IoT downloads and the long query can break some ESP32 URL parsers.
+    # Provide a short proxy URL hosted by this backend: /api/tts/audio/<id>
+    token = secrets.token_urlsafe(10)
+    _tts_cache[token] = (upstream_url, time.time())
+    proxy_url = f"/api/tts/audio/{token}"
+    absolute_proxy_url = request.host_url.rstrip("/") + proxy_url
     return jsonify({
         "ok": True,
         "provider": "poe",
         "upstream_url": upstream_url,
         "url": proxy_url,
-        "note": "Use `url` to download audio via this backend (proxy).",
+        "absolute_url": absolute_proxy_url,
+        "note": "Use `absolute_url` for ESP32 playback (short proxy).",
     }), 200
 
 
-@app.route("/api/tts/audio", methods=["GET"])
-def tts_audio():
+def _tts_cache_get(token: str):
+    item = _tts_cache.get(token)
+    if not item:
+        return None
+    upstream_url, created = item
+    if (time.time() - created) > _tts_cache_ttl_sec:
+        _tts_cache.pop(token, None)
+        return None
+    return upstream_url
+
+
+@app.route("/api/tts/audio/<token>", methods=["GET"])
+def tts_audio_token(token: str):
     """
     Proxy audio download to bypass upstream access restrictions.
-    Query: ?u=<upstream_url>
+    Path: /api/tts/audio/<token> (token maps to upstream_url in cache)
     Returns: audio bytes with Content-Type forwarded when possible.
     """
-    upstream_url = (request.args.get("u") or "").strip()
-    if not upstream_url.startswith("http"):
-        return jsonify({"ok": False, "error": "Missing or invalid `u`"}), 400
+    upstream_url = _tts_cache_get(token)
+    if not upstream_url:
+        return jsonify({"ok": False, "error": "Invalid or expired token"}), 404
 
     try:
         # Some CDNs require a User-Agent header.
