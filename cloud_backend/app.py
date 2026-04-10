@@ -13,6 +13,7 @@ import time
 import secrets
 import base64
 import io
+import concurrent.futures
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from pymongo import MongoClient
@@ -67,6 +68,7 @@ def index():
             "GET /chat": "瀏覽器文字 AI 聊天頁",
             "POST /api/tts": "文字 → 語音（Poe TTS：回傳音檔 URL）",
             "POST /api/stt": "語音（WAV）→ 文字（OpenAI STT）",
+            "POST /api/command": "文字 → 家居控制指令（action/device）",
             "POST /api/data": "上傳裝置資料（AI 結果等）",
             "POST /api/chat": "文字 → 雲端 AI 回覆（OPENAI_API_KEY 或模擬模式）",
             "GET /api/health": "健康檢查",
@@ -137,19 +139,106 @@ def post_data():
     }), 201
 
 
-def _openai_chat(user_text: str) -> str:
+@app.route("/api/log", methods=["POST"])
+def log_interaction():
+    """
+    Store one interaction (text in/out) into MongoDB.
+    JSON: { "device_id": "...", "input_text": "...", "output_text": "...", "kind": "command|chat|other" }
+    """
+    if client is None:
+        return jsonify({"ok": False, "error": "MongoDB not connected"}), 503
+
+    body = request.get_json(force=True, silent=True)
+    if not body:
+        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+
+    device_id = (body.get("device_id") or "unknown").strip()[:128]
+    input_text = (body.get("input_text") or "").strip()
+    output_text = (body.get("output_text") or "").strip()
+    kind = (body.get("kind") or "other").strip()[:32]
+
+    if not input_text:
+        return jsonify({"ok": False, "error": "input_text is empty"}), 400
+    if not output_text:
+        return jsonify({"ok": False, "error": "output_text is empty"}), 400
+
+    # Limit sizes to protect DB
+    if len(input_text) > 4000:
+        input_text = input_text[:4000]
+    if len(output_text) > 4000:
+        output_text = output_text[:4000]
+
+    try:
+        col = client[DB_NAME]["interaction_logs"]
+        r = col.insert_one(
+            {
+                "device_id": device_id,
+                "kind": kind,
+                "input_text": input_text,
+                "output_text": output_text,
+                "ts": datetime.utcnow(),
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "id": str(r.inserted_id)}), 201
+
+
+# /api/chat：請模型在回覆最後一行輸出 DEVICE_CMD（供 ESP32 解析）；亦會寫入 JSON 欄位 device_cmd
+CHAT_SYSTEM_IOT = """你是簡短、友善的助手，用繁體中文回答，盡量精簡。
+使用者可能透過物聯網裝置控制一顆 LED 燈。
+請先給使用者自然、有幫助的回覆；然後在**最後單獨一行**（這行之後不要再輸出任何字）輸出下列格式之一：
+DEVICE_CMD: ON
+DEVICE_CMD: OFF
+DEVICE_CMD: NONE
+規則：若使用者想開燈、亮燈、打開燈、turn on 等 → ON；想關燈、熄燈、turn off → OFF；一般聊天或與燈無關 → NONE。"""
+
+
+def _split_device_cmd_line(reply: str) -> tuple:
+    """回傳 (給使用者看的純文字, 'ON'|'OFF'|'NONE')。"""
+    if not reply or not reply.strip():
+        return "", "NONE"
+    lines = reply.strip().splitlines()
+    last = lines[-1].strip()
+    up = last.upper()
+    if up.startswith("DEVICE_CMD:"):
+        part = last.split(":", 1)[1].strip().upper()
+        if part in ("ON", "OFF", "NONE"):
+            clean = "\n".join(lines[:-1]).strip()
+            return (clean if clean else "（無文字內容）"), part
+    return reply.strip(), "NONE"
+
+
+def _heuristic_device_cmd(user_msg: str) -> str:
+    """使用者文字簡易規則（模型未遵守格式時的後備）。"""
+    s = (user_msg or "").strip()
+    t = s.lower().replace(" ", "")
+    if any(x in s for x in ("關燈", "關掉", "熄燈")) or "turnoff" in t:
+        return "OFF"
+    if any(x in s for x in ("開燈", "打開", "亮燈", "點亮", "點燈")) or "turnon" in t:
+        return "ON"
+    if t.startswith("關") and "燈" in s:
+        return "OFF"
+    if t.startswith("開") and "燈" in s:
+        return "ON"
+    return "NONE"
+
+
+def _openai_chat(user_text: str, system_prompt: str | None = None) -> str:
     """呼叫 OpenAI Chat Completions；失敗時拋出例外。"""
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise ValueError("OPENAI_API_KEY not set")
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    sys_content = system_prompt or "你是簡短、友善的助手，用繁體中文回答，盡量精簡。"
     payload = json_lib.dumps(
         {
             "model": model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是簡短、友善的助手，用繁體中文回答，盡量精簡。",
+                    "content": sys_content,
                 },
                 {"role": "user", "content": user_text[:8000]},
             ],
@@ -168,20 +257,21 @@ def _openai_chat(user_text: str) -> str:
         data = json_lib.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"].strip()
 
-def _poe_chat(user_text: str) -> str:
+def _poe_chat(user_text: str, system_prompt: str | None = None) -> str:
     """呼叫 Poe Chat Completions（OpenAI-compatible）；失敗時拋出例外。"""
     key = os.environ.get("POE_API_KEY", "").strip()
     if not key:
         raise ValueError("POE_API_KEY not set")
     # Poe uses bot names as model id. You may need to change this in Railway variables.
     model = os.environ.get("POE_MODEL", "gpt-4o-mini")
+    sys_content = system_prompt or "你是簡短、友善的助手，用繁體中文回答，盡量精簡。"
     payload = json_lib.dumps(
         {
             "model": model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是簡短、友善的助手，用繁體中文回答，盡量精簡。",
+                    "content": sys_content,
                 },
                 {"role": "user", "content": user_text[:8000]},
             ],
@@ -200,6 +290,129 @@ def _poe_chat(user_text: str) -> str:
     with urllib.request.urlopen(req, timeout=90) as resp:
         data = json_lib.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"].strip()
+
+def _poe_command(user_text: str, devices: list[str]) -> dict:
+    """
+    Use Poe chat completions to convert natural language into a command JSON.
+    Returns a dict with keys: action, device, say (optional), confidence (optional).
+    """
+    key = os.environ.get("POE_API_KEY", "").strip()
+    if not key:
+        raise ValueError("POE_API_KEY not set")
+    model = os.environ.get("POE_MODEL", "gpt-4o-mini")
+    devices_str = ", ".join(devices) if devices else "light1"
+    sys = (
+        "你是一個家居控制指令解析器。"
+        "請把使用者輸入解析為 JSON，且只能輸出 JSON，不要輸出其他文字。"
+        "JSON 格式固定為："
+        '{"action":"on|off|toggle|status|unknown","device":"<device>","say":"<繁體中文回覆，可選>","confidence":0.0}'
+        "其中 device 必須從允許清單中挑一個；若沒提到就用 light1。"
+        f"允許的 device 清單：{devices_str}。"
+        "若是聊天或無法判斷，action=unknown，confidence=0。"
+    )
+    payload = json_lib.dumps(
+        {
+            "model": model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user_text[:2000]},
+            ],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.poe.com/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    raw = (data["choices"][0]["message"]["content"] or "").strip()
+    if not raw:
+        return {"action": "unknown", "device": "light1", "say": "", "confidence": 0.0}
+    # Best-effort: model might wrap JSON in code fences
+    txt = raw
+    if "```" in txt:
+        txt = txt.replace("```json", "").replace("```", "").strip()
+    try:
+        obj = json_lib.loads(txt)
+    except Exception:
+        return {"action": "unknown", "device": "light1", "say": "", "confidence": 0.0}
+    if not isinstance(obj, dict):
+        return {"action": "unknown", "device": "light1", "say": "", "confidence": 0.0}
+    action = str(obj.get("action") or "unknown").lower().strip()
+    device = str(obj.get("device") or "light1").strip()
+    say = str(obj.get("say") or "").strip()
+    try:
+        conf = float(obj.get("confidence") or 0.0)
+    except Exception:
+        conf = 0.0
+    if devices and device not in devices:
+        device = devices[0]
+    if action not in ("on", "off", "toggle", "status", "unknown"):
+        action = "unknown"
+    if conf < 0.0:
+        conf = 0.0
+    if conf > 1.0:
+        conf = 1.0
+    return {"action": action, "device": device, "say": say, "confidence": conf}
+
+
+@app.route("/api/command", methods=["POST"])
+def command():
+    """
+    Natural language -> structured device command.
+    JSON: { "text": "幫我開燈", "device_id": "optional" }
+    Returns: { ok, action, device, say, confidence, mode }
+    """
+    body = request.get_json(force=True, silent=True)
+    if not body:
+        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+    text = (body.get("text") or body.get("message") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "text is empty"}), 400
+    if len(text) > 2000:
+        text = text[:2000]
+
+    devices_env = os.environ.get("COMMAND_DEVICES", "light1,light2").strip()
+    devices = [d.strip() for d in devices_env.split(",") if d.strip()]
+    if not devices:
+        devices = ["light1"]
+
+    try:
+        provider = os.environ.get("AI_PROVIDER", "").strip().lower()
+        if not provider:
+            if os.environ.get("OPENAI_API_KEY", "").strip():
+                provider = "openai"
+            elif os.environ.get("POE_API_KEY", "").strip():
+                provider = "poe"
+        if provider == "poe":
+            cmd = _poe_command(text, devices)
+            mode = "poe"
+        else:
+            # Fallback: simple keyword rules if no Poe configured
+            t = text.lower()
+            action = "unknown"
+            if "off" in t or "關" in text:
+                action = "off"
+            elif "on" in t or "開" in text:
+                action = "on"
+            cmd = {"action": action, "device": devices[0], "say": "", "confidence": 0.0}
+            mode = "rule"
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    return jsonify(
+        {
+            "ok": True,
+            "action": cmd.get("action", "unknown"),
+            "device": cmd.get("device", devices[0]),
+            "say": cmd.get("say", ""),
+            "confidence": cmd.get("confidence", 0.0),
+            "mode": mode,
+        }
+    ), 200
 
 def _poe_tts_url(text: str) -> str:
     """呼叫 Poe TTS，回傳音檔 URL（目前已驗證 message.content 會是 URL）。"""
@@ -317,7 +530,11 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
 
     msg = fp.ProtocolMessage(
         role="user",
-        content="請把這段音訊轉成文字，只輸出轉寫結果，不要加其他說明。",
+        content=(
+            "請把這段音訊『逐字轉寫成繁體中文』，"
+            "不要翻譯成其他語言，也不要總結或改寫，只輸出聽到的內容本身，"
+            "不加任何說明或標註。"
+        ),
         attachments=[att],
     )
 
@@ -334,6 +551,16 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
     if not text:
         raise ValueError("Poe STT returned empty text")
     return text
+
+
+def _run_with_timeout(fn, timeout_sec: float):
+    """
+    Run a blocking function with a wall-clock timeout.
+    This prevents requests from hanging until the gunicorn worker timeout.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        return fut.result(timeout=timeout_sec)
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -365,10 +592,10 @@ def chat():
                 provider = "poe"
 
         if provider == "openai":
-            reply = _openai_chat(msg)
+            reply = _openai_chat(msg, CHAT_SYSTEM_IOT)
             mode = "openai"
         elif provider == "poe":
-            reply = _poe_chat(msg)
+            reply = _poe_chat(msg, CHAT_SYSTEM_IOT)
             mode = "poe"
     except Exception as e:
         return jsonify(
@@ -381,12 +608,18 @@ def chat():
 
     if reply is None:
         # 無 API Key：模擬回覆，方便先測 Serial → 雲端流程
+        hcmd = _heuristic_device_cmd(msg)
         reply = (
             f"[模擬模式] 已收到你的內容（前 80 字）：{msg[:80]}"
             + ("…" if len(msg) > 80 else "")
-            + "。請在 Railway 環境變數設定 OPENAI_API_KEY 以啟用真實 AI 回覆。"
+            + "。請在 Railway 環境變數設定 OPENAI_API_KEY 以啟用真實 AI 回覆。\n"
+            f"DEVICE_CMD: {hcmd}"
         )
         mode = "mock"
+
+    reply_clean, device_cmd = _split_device_cmd_line(reply)
+    if device_cmd == "NONE" and mode != "mock":
+        device_cmd = _heuristic_device_cmd(msg)
 
     # 可選：寫入 MongoDB（與 device_readings 分開）
     if collection is not None:
@@ -396,7 +629,8 @@ def chat():
                 {
                     "device_id": device_id,
                     "user_message": msg,
-                    "ai_reply": reply,
+                    "ai_reply": reply_clean,
+                    "device_cmd": device_cmd,
                     "mode": mode,
                     "timestamp": datetime.utcnow(),
                 }
@@ -404,7 +638,14 @@ def chat():
         except Exception:
             pass
 
-    return jsonify({"ok": True, "reply": reply, "mode": mode}), 200
+    return jsonify(
+        {
+            "ok": True,
+            "reply": reply_clean,
+            "device_cmd": device_cmd,
+            "mode": mode,
+        }
+    ), 200
 
 
 @app.route("/api/tts", methods=["POST"])

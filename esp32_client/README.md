@@ -4,7 +4,7 @@
 
 ## 必要程式庫
 
-- **ArduinoJson**（草稿碼 → 匯入程式庫 → 管理程式庫 → 搜尋 "ArduinoJson" 安裝）
+- **不需額外程式庫**（已改為手動組 JSON；僅需 ESP32 核心內建 **WiFi / HTTPClient / WiFiClientSecure**）
 
 ## 修改設定
 

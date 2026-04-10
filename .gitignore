@@ -2,12 +2,18 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
 .venv/
 venv/
+
+# Secrets (ESP32)
+**/wifi_secrets.h
+**/*secrets*.h
 
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
