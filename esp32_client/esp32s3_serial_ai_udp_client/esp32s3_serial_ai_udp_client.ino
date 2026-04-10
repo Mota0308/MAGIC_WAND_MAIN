@@ -8,7 +8,7 @@
  *
  * C3 端請燒錄：esp32c3_udp_led_server.ino，並把本機 UDP_TARGET_IP 設為 C3 的 IP。
  *
- * 雲端 /api/chat 會回傳 JSON 欄位 device_cmd: ON | OFF | NONE（由 AI 依 system prompt 判斷）。
+ * 雲端 /api/chat 會回傳 JSON 欄位 device_cmd: ON | OFF | NONE | B0 | B25 | B50 | B75 | B100（由 AI 依 system prompt 判斷亮度檔位）。
  * 設 SERIAL_AI_FORCE_CLOUD 為 1 可略過本地關鍵字、一律走雲端 AI。
  *
  * Serial 115200；ESP32-S3 若 Serial 空白可開 Tools -> USB CDC On Boot
@@ -17,7 +17,7 @@
 #include <Arduino.h>
 
 #ifndef SERIAL_AI_FORCE_CLOUD
-#define SERIAL_AI_FORCE_CLOUD 0  // 1 = 全部交給雲端 AI 判斷 device_cmd
+#define SERIAL_AI_FORCE_CLOUD 1  // 1 = 全部交給雲端 AI 判斷 device_cmd
 #endif
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -70,6 +70,33 @@ static bool matchVoiceCommand(const String& text, String& outCmd, String& outSay
   String s = text;
   s.toLowerCase();
   s.replace(" ", "");
+
+  // 亮度（與 ESP32-C3 UDP B0/B25/... 一致；需先於 ON/OFF 以免被「開燈」誤判）
+  if (s.indexOf("100%") >= 0 || s.indexOf("最亮") >= 0 || s.indexOf("全亮") >= 0) {
+    outCmd = "B100";
+    outSay = "已設為最亮";
+    return true;
+  }
+  if (s.indexOf("75%") >= 0 || s.indexOf("七成五") >= 0) {
+    outCmd = "B75";
+    outSay = "已設為 75%";
+    return true;
+  }
+  if (s.indexOf("50%") >= 0 || s.indexOf("一半") >= 0 || s.indexOf("五成") >= 0) {
+    outCmd = "B50";
+    outSay = "已設為 50%";
+    return true;
+  }
+  if (s.indexOf("25%") >= 0 || s.indexOf("二成五") >= 0) {
+    outCmd = "B25";
+    outSay = "已設為 25%";
+    return true;
+  }
+  if (s.indexOf("最暗") >= 0 || s.indexOf("全暗") >= 0) {
+    outCmd = "B0";
+    outSay = "已設為最暗";
+    return true;
+  }
 
   // OFF first (avoid ambiguity with phrases containing 開/關)
   if (s.indexOf("關燈") >= 0 || s.indexOf("關掉") >= 0 || s.indexOf("關") == 0 || s.indexOf("off") >= 0) {
@@ -364,6 +391,14 @@ void loop() {
     Serial.println("[PATH] AI device_cmd -> UDP OFF");
     udpSendCommand("OFF");
     httpPostLogBestEffort(line, "OFF", "ai_device_cmd");
+  } else if (deviceCmd == "b0" || deviceCmd == "b25" || deviceCmd == "b50" || deviceCmd == "b75" ||
+             deviceCmd == "b100") {
+    String u = deviceCmd;
+    u.toUpperCase();
+    Serial.print("[PATH] AI device_cmd -> UDP ");
+    Serial.println(u);
+    udpSendCommand(u.c_str());
+    httpPostLogBestEffort(line, u, "ai_device_cmd");
   } else if (matchVoiceCommand(reply, cmdUdp, say)) {
     Serial.print("[PATH] AI reply text fallback -> UDP ");
     Serial.println(cmdUdp);

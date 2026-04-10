@@ -27,6 +27,33 @@ WiFiUDP udp;
 // 與 esp8266_led_test 外接 LED 一致：GPIO4，active-HIGH
 static const int LED_PIN = 4;
 
+// PWM (LEDC) for brightness control (0/25/50/75/100%)
+static const uint32_t PWM_FREQ_HZ = 5000;
+static const uint8_t PWM_RES_BITS = 8;  // duty 0..255
+
+// NOTE: This sketch uses the Arduino-ESP32 v3.x LEDC API:
+//   ledcAttach(pin, freq, resolution) + ledcWrite(pin, duty)
+// If you are on an older Arduino-ESP32 core (2.x), upgrade the ESP32 board package.
+static bool pwmBegin() {
+  return ledcAttach(LED_PIN, PWM_FREQ_HZ, PWM_RES_BITS);
+}
+
+static void pwmWriteDuty(uint32_t duty) {
+  ledcWrite(LED_PIN, duty);
+}
+
+static void setBrightnessPercent(int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  uint32_t dutyMax = (1u << PWM_RES_BITS) - 1u;
+  uint32_t duty = (uint32_t)((pct * (int)dutyMax + 50) / 100);  // rounded
+  pwmWriteDuty(duty);
+  Serial.print("[PWM] brightness=");
+  Serial.print(pct);
+  Serial.print("% duty=");
+  Serial.println((int)duty);
+}
+
 static void replyUdp(const char* msg) {
   udp.beginPacket(udp.remoteIP(), udp.remotePort());
   udp.print(msg);
@@ -64,10 +91,13 @@ void setup() {
   Serial.println("[BOOT] Sketch: esp32c3_udp_led_server.ino");
   Serial.print("[BOOT] LED GPIO = ");
   Serial.print(LED_PIN);
-  Serial.println(" (external LED, HIGH=ON)");
+  Serial.println(" (external LED, PWM capable)");
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // PWM setup
+  if (!pwmBegin()) {
+    Serial.println("[ERR] PWM init failed (LEDC attach)");
+  }
+  setBrightnessPercent(0);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -91,7 +121,7 @@ void setup() {
   udp.begin(UDP_PORT);
   Serial.print("[BOOT] UDP listen port ");
   Serial.println(UDP_PORT);
-  Serial.println("[BOOT] Payload: ON / OFF");
+  Serial.println("[BOOT] Payload: ON / OFF / B0 / B25 / B50 / B75 / B100");
   Serial.println("========== [BOOT] READY =================================");
 }
 
@@ -113,18 +143,34 @@ void loop() {
   Serial.println("\"");
 
   if (cmdEqCi(buf, "ON")) {
-    digitalWrite(LED_PIN, HIGH);
-    Serial.println("[RESULT] OK — ON  -> LED GPIO HIGH");
-    replyUdp("OK ON");
+    setBrightnessPercent(100);
+    Serial.println("[RESULT] OK — ON -> brightness 100%");
+    replyUdp("OK ON 100");
     return;
   }
   if (cmdEqCi(buf, "OFF")) {
-    digitalWrite(LED_PIN, LOW);
-    Serial.println("[RESULT] OK — OFF -> LED GPIO LOW");
-    replyUdp("OK OFF");
+    setBrightnessPercent(0);
+    Serial.println("[RESULT] OK — OFF -> brightness 0%");
+    replyUdp("OK OFF 0");
     return;
   }
 
-  Serial.println("[RESULT] FAIL — need ON or OFF");
+  // Brightness commands: B0/B25/B50/B75/B100 (case-insensitive)
+  if (buf[0] == 'B' || buf[0] == 'b') {
+    int pct = atoi(buf + 1);
+    if (pct == 0 || pct == 25 || pct == 50 || pct == 75 || pct == 100) {
+      setBrightnessPercent(pct);
+      Serial.println("[RESULT] OK — brightness set");
+      char resp[32];
+      snprintf(resp, sizeof(resp), "OK B%d", pct);
+      replyUdp(resp);
+      return;
+    }
+    Serial.println("[RESULT] FAIL — brightness must be 0/25/50/75/100");
+    replyUdp("ERR bad brightness");
+    return;
+  }
+
+  Serial.println("[RESULT] FAIL — need ON/OFF/Bxx");
   replyUdp("ERR unknown");
 }

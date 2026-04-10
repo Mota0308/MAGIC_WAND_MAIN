@@ -187,16 +187,30 @@ def log_interaction():
 
 # /api/chat：請模型在回覆最後一行輸出 DEVICE_CMD（供 ESP32 解析）；亦會寫入 JSON 欄位 device_cmd
 CHAT_SYSTEM_IOT = """你是簡短、友善的助手，用繁體中文回答，盡量精簡。
-使用者可能透過物聯網裝置控制一顆 LED 燈。
+使用者可能透過物聯網裝置控制一顆可調亮度的 LED 燈（亮度僅能設為 0%、25%、50%、75%、100%）。
 請先給使用者自然、有幫助的回覆；然後在**最後單獨一行**（這行之後不要再輸出任何字）輸出下列格式之一：
 DEVICE_CMD: ON
 DEVICE_CMD: OFF
 DEVICE_CMD: NONE
-規則：若使用者想開燈、亮燈、打開燈、turn on 等 → ON；想關燈、熄燈、turn off → OFF；一般聊天或與燈無關 → NONE。"""
+DEVICE_CMD: B0
+DEVICE_CMD: B25
+DEVICE_CMD: B50
+DEVICE_CMD: B75
+DEVICE_CMD: B100
+規則：
+- 想開燈到最亮、或沒指定亮度 → ON（等同 100%）；或明確要 100% → B100。
+- 想關燈 → OFF；或要 0% 亮度 → B0。
+- 使用者明確說出「25%/一半略暗/四分之一亮度」等 → 對應 B25/B50/B75（依語意選最接近的一檔）。
+- 一般聊天或與燈無關 → NONE。"""
+
+
+_VALID_DEVICE_CMDS = frozenset(
+    {"ON", "OFF", "NONE", "B0", "B25", "B50", "B75", "B100"}
+)
 
 
 def _split_device_cmd_line(reply: str) -> tuple:
-    """回傳 (給使用者看的純文字, 'ON'|'OFF'|'NONE')。"""
+    """回傳 (給使用者看的純文字, device_cmd 字串供 JSON)。"""
     if not reply or not reply.strip():
         return "", "NONE"
     lines = reply.strip().splitlines()
@@ -204,7 +218,7 @@ def _split_device_cmd_line(reply: str) -> tuple:
     up = last.upper()
     if up.startswith("DEVICE_CMD:"):
         part = last.split(":", 1)[1].strip().upper()
-        if part in ("ON", "OFF", "NONE"):
+        if part in _VALID_DEVICE_CMDS:
             clean = "\n".join(lines[:-1]).strip()
             return (clean if clean else "（無文字內容）"), part
     return reply.strip(), "NONE"
@@ -214,6 +228,17 @@ def _heuristic_device_cmd(user_msg: str) -> str:
     """使用者文字簡易規則（模型未遵守格式時的後備）。"""
     s = (user_msg or "").strip()
     t = s.lower().replace(" ", "")
+    # 亮度檔位（與 ESP32-C3 UDP B0/B25/... 一致）
+    if "100%" in s or "最亮" in s or "全亮" in s:
+        return "B100"
+    if "最暗" in s or "全暗" in s:
+        return "B0"
+    if "75%" in s or "七成五" in s:
+        return "B75"
+    if "50%" in s or "一半" in s or "五成" in s:
+        return "B50"
+    if "25%" in s or "二成五" in s:
+        return "B25"
     if any(x in s for x in ("關燈", "關掉", "熄燈")) or "turnoff" in t:
         return "OFF"
     if any(x in s for x in ("開燈", "打開", "亮燈", "點亮", "點燈")) or "turnon" in t:
@@ -223,6 +248,89 @@ def _heuristic_device_cmd(user_msg: str) -> str:
     if t.startswith("開") and "燈" in s:
         return "ON"
     return "NONE"
+
+
+def _load_recent_chat_history(device_id: str, max_turns: int) -> list[dict]:
+    """
+    從 MongoDB chat_logs 讀取最近 max_turns 輪對話（每輪包含 user + assistant）。
+    回傳 OpenAI messages 格式的 list[dict]，不包含 system 與本次 user 訊息。
+    MongoDB 未連線時回傳空陣列。
+    """
+    if client is None:
+        return []
+    if max_turns <= 0:
+        return []
+    did = (device_id or "serial_chat").strip()[:128]
+    try:
+        chat_col = client[DB_NAME]["chat_logs"]
+        cur = (
+            chat_col.find({"device_id": did}, {"user_message": 1, "ai_reply": 1, "timestamp": 1})
+            .sort("timestamp", -1)
+            .limit(int(max_turns))
+        )
+        docs = list(cur)
+    except Exception:
+        return []
+
+    docs.reverse()  # oldest -> newest
+    msgs: list[dict] = []
+    for d in docs:
+        um = (d.get("user_message") or "").strip()
+        ar = (d.get("ai_reply") or "").strip()
+        if um:
+            msgs.append({"role": "user", "content": um[:8000]})
+        if ar:
+            msgs.append({"role": "assistant", "content": ar[:8000]})
+    return msgs
+
+
+def _build_chat_messages(device_id: str, user_text: str, system_prompt: str | None) -> list[dict]:
+    sys_content = system_prompt or "你是簡短、友善的助手，用繁體中文回答，盡量精簡。"
+    max_turns = int(os.environ.get("CHAT_MEMORY_TURNS", "8") or "8")
+    history = _load_recent_chat_history(device_id, max_turns=max_turns)
+    return [{"role": "system", "content": sys_content}] + history + [{"role": "user", "content": (user_text or "")[:8000]}]
+
+
+def _openai_chat_messages(messages: list[dict]) -> str:
+    """呼叫 OpenAI Chat Completions（messages 版）；失敗時拋出例外。"""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise ValueError("OPENAI_API_KEY not set")
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    payload = json_lib.dumps({"model": model, "messages": messages}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _poe_chat_messages(messages: list[dict]) -> str:
+    """呼叫 Poe Chat Completions（OpenAI-compatible；messages 版）；失敗時拋出例外。"""
+    key = os.environ.get("POE_API_KEY", "").strip()
+    if not key:
+        raise ValueError("POE_API_KEY not set")
+    model = os.environ.get("POE_MODEL", "gpt-4o-mini")
+    payload = json_lib.dumps({"model": model, "messages": messages, "stream": False}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.poe.com/v1/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json_lib.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def _openai_chat(user_text: str, system_prompt: str | None = None) -> str:
@@ -592,10 +700,12 @@ def chat():
                 provider = "poe"
 
         if provider == "openai":
-            reply = _openai_chat(msg, CHAT_SYSTEM_IOT)
+            messages = _build_chat_messages(device_id, msg, CHAT_SYSTEM_IOT)
+            reply = _openai_chat_messages(messages)
             mode = "openai"
         elif provider == "poe":
-            reply = _poe_chat(msg, CHAT_SYSTEM_IOT)
+            messages = _build_chat_messages(device_id, msg, CHAT_SYSTEM_IOT)
+            reply = _poe_chat_messages(messages)
             mode = "poe"
     except Exception as e:
         return jsonify(
