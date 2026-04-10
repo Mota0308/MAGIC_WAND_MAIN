@@ -201,7 +201,8 @@ DEVICE_CMD: B100
 - 想開燈到最亮、或沒指定亮度 → ON（等同 100%）；或明確要 100% → B100。
 - 想關燈 → OFF；或要 0% 亮度 → B0。
 - 使用者明確說出「25%/一半略暗/四分之一亮度」等 → 對應 B25/B50/B75（依語意選最接近的一檔）。
-- 一般聊天或與燈無關 → NONE。"""
+- 一般聊天或與燈無關 → NONE。
+- 若使用者問「有哪些設備/裝置」「可連接哪些」「列出設備」等（僅查詢、不控制燈），請依下方「已登記清單」用繁體中文簡短列出名稱與 IP，然後 DEVICE_CMD: NONE。"""
 
 
 _VALID_DEVICE_CMDS = frozenset(
@@ -209,19 +210,71 @@ _VALID_DEVICE_CMDS = frozenset(
 )
 
 
-def _split_device_cmd_line(reply: str) -> tuple:
-    """回傳 (給使用者看的純文字, device_cmd 字串供 JSON)。"""
+def _iot_system_prompt(udp_targets: list | None) -> str:
+    """若 ESP32 傳入 udp_targets，追加清單說明；多臺時再加選目標格式。"""
+    if not udp_targets:
+        return CHAT_SYSTEM_IOT
+    rows: list[tuple[str, str]] = []
+    for t in udp_targets:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()[:64]
+        ip = str(t.get("ip") or "").strip()[:64]
+        if name and ip:
+            rows.append((name, ip))
+    if not rows:
+        return CHAT_SYSTEM_IOT
+    lines_txt = "\n".join(f"- {n}（{ipa}）" for n, ipa in rows)
+    extra = f"""
+
+目前本裝置已登記、可透過 UDP 控制的目標如下（使用者若僅詢問「有哪些設備」請據此列出，DEVICE_CMD: NONE）：
+{lines_txt}"""
+    if len(rows) > 1:
+        extra += f"""
+
+目前已登記多個燈控裝置（請依使用者語意判斷要控制哪一台）：
+當使用者要控制「特定那一台」時，請在 DEVICE_CMD 那一行的**正上方**多輸出一行：
+DEVICE_TARGET: <名稱，須與上面列表中的名稱一致>
+若使用者未指定哪一台、或無法判斷、或與燈無關、或語意是「全部」時，輸出：
+DEVICE_TARGET: NONE
+若只輸出 DEVICE_CMD 而未輸出 DEVICE_TARGET，裝置會沿用目前選中的目標。"""
+    return CHAT_SYSTEM_IOT + extra
+
+
+def _split_device_reply(reply: str) -> tuple:
+    """回傳 (給使用者看的純文字, device_cmd, device_target 名稱或空字串表示不換目標)。"""
     if not reply or not reply.strip():
-        return "", "NONE"
+        return "", "NONE", ""
     lines = reply.strip().splitlines()
-    last = lines[-1].strip()
-    up = last.upper()
-    if up.startswith("DEVICE_CMD:"):
-        part = last.split(":", 1)[1].strip().upper()
-        if part in _VALID_DEVICE_CMDS:
-            clean = "\n".join(lines[:-1]).strip()
-            return (clean if clean else "（無文字內容）"), part
-    return reply.strip(), "NONE"
+    device_cmd = "NONE"
+    device_target = ""
+    idx = len(lines) - 1
+    if idx >= 0:
+        last = lines[idx].strip()
+        up = last.upper()
+        if up.startswith("DEVICE_CMD:"):
+            part = last.split(":", 1)[1].strip().upper()
+            if part in _VALID_DEVICE_CMDS:
+                device_cmd = part
+                idx -= 1
+    if idx >= 0:
+        prev = lines[idx].strip()
+        pup = prev.upper()
+        if pup.startswith("DEVICE_TARGET:"):
+            raw = prev.split(":", 1)[1].strip()
+            if raw.upper() == "NONE" or not raw:
+                device_target = ""
+            else:
+                device_target = raw[:128]
+            idx -= 1
+    clean = "\n".join(lines[: idx + 1]).strip()
+    return (clean if clean else "（無文字內容）"), device_cmd, device_target
+
+
+def _split_device_cmd_line(reply: str) -> tuple:
+    """相容舊邏輯：僅解析 DEVICE_CMD。"""
+    c, cmd, _ = _split_device_reply(reply)
+    return c, cmd
 
 
 def _heuristic_device_cmd(user_msg: str) -> str:
@@ -248,6 +301,23 @@ def _heuristic_device_cmd(user_msg: str) -> str:
     if t.startswith("開") and "燈" in s:
         return "ON"
     return "NONE"
+
+
+def _heuristic_device_target(user_msg: str, udp_targets: list | None) -> str:
+    """模擬模式：若訊息含某台名稱子字串，回傳該名稱；否則空字串。"""
+    if not udp_targets or len(udp_targets) <= 1:
+        return ""
+    s = user_msg or ""
+    best = ""
+    best_len = 0
+    for t in udp_targets:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if len(name) >= 1 and name in s and len(name) > best_len:
+            best = name
+            best_len = len(name)
+    return best
 
 
 def _load_recent_chat_history(device_id: str, max_turns: int, max_docs_cap: int = 0) -> list[dict]:
@@ -693,7 +763,10 @@ def _run_with_timeout(fn, timeout_sec: float):
 def chat():
     """
     ESP32 Serial 測試用：上傳使用者文字，雲端運算後回傳 AI 回覆。
-    JSON: { "message": "你好", "device_id": "esp32_001" }（device_id 可選）
+    JSON: { "message": "你好", "device_id": "esp32_001", "include_tts": true,
+            "udp_targets": [ {"name":"客廳","ip":"192.168.1.10"}, ... ] }（後兩者可選）
+    多個 UDP 目標時，模型可輸出 DEVICE_TARGET（上一行）+ DEVICE_CMD；回應 JSON 含 device_target。
+    include_tts=true 且已設定 POE_API_KEY 時，同時回傳 tts_absolute_url，省裝置再 POST /api/tts。
     """
     body = request.get_json(force=True, silent=True)
     if not body:
@@ -705,6 +778,10 @@ def chat():
         msg = msg[:8000]
 
     device_id = body.get("device_id", "serial_chat")
+    want_inline_tts = bool(body.get("include_tts") or body.get("tts"))
+    udp_targets = body.get("udp_targets")
+    if not isinstance(udp_targets, list):
+        udp_targets = None
     reply = None
     mode = "mock"
 
@@ -717,12 +794,13 @@ def chat():
             elif os.environ.get("POE_API_KEY", "").strip():
                 provider = "poe"
 
+        sys_iot = _iot_system_prompt(udp_targets)
         if provider == "openai":
-            messages = _build_chat_messages(device_id, msg, CHAT_SYSTEM_IOT)
+            messages = _build_chat_messages(device_id, msg, sys_iot)
             reply = _openai_chat_messages(messages)
             mode = "openai"
         elif provider == "poe":
-            messages = _build_chat_messages(device_id, msg, CHAT_SYSTEM_IOT)
+            messages = _build_chat_messages(device_id, msg, sys_iot)
             reply = _poe_chat_messages(messages)
             mode = "poe"
     except Exception as e:
@@ -737,15 +815,20 @@ def chat():
     if reply is None:
         # 無 API Key：模擬回覆，方便先測 Serial → 雲端流程
         hcmd = _heuristic_device_cmd(msg)
+        htarget = _heuristic_device_target(msg, udp_targets)
+        tail = ""
+        if udp_targets and len(udp_targets) > 1 and htarget:
+            tail = f"\nDEVICE_TARGET: {htarget}"
         reply = (
             f"[模擬模式] 已收到你的內容（前 80 字）：{msg[:80]}"
             + ("…" if len(msg) > 80 else "")
             + "。請在 Railway 環境變數設定 OPENAI_API_KEY 以啟用真實 AI 回覆。\n"
-            f"DEVICE_CMD: {hcmd}"
+            + tail
+            + f"\nDEVICE_CMD: {hcmd}"
         )
         mode = "mock"
 
-    reply_clean, device_cmd = _split_device_cmd_line(reply)
+    reply_clean, device_cmd, device_target = _split_device_reply(reply)
     if device_cmd == "NONE" and mode != "mock":
         device_cmd = _heuristic_device_cmd(msg)
 
@@ -753,27 +836,46 @@ def chat():
     if collection is not None:
         try:
             chat_col = client[DB_NAME]["chat_logs"]
-            chat_col.insert_one(
-                {
-                    "device_id": device_id,
-                    "user_message": msg,
-                    "ai_reply": reply_clean,
-                    "device_cmd": device_cmd,
-                    "mode": mode,
-                    "timestamp": datetime.utcnow(),
-                }
-            )
+            doc = {
+                "device_id": device_id,
+                "user_message": msg,
+                "ai_reply": reply_clean,
+                "device_cmd": device_cmd,
+                "mode": mode,
+                "timestamp": datetime.utcnow(),
+            }
+            if device_target:
+                doc["device_target"] = device_target
+            chat_col.insert_one(doc)
         except Exception:
             pass
 
-    return jsonify(
-        {
-            "ok": True,
-            "reply": reply_clean,
-            "device_cmd": device_cmd,
-            "mode": mode,
-        }
-    ), 200
+    out: dict = {
+        "ok": True,
+        "reply": reply_clean,
+        "device_cmd": device_cmd,
+        "device_target": device_target,
+        "mode": mode,
+    }
+    # 一次請求內完成 TTS，省 ESP32 再 POST /api/tts 的往返延遲（需 POE_API_KEY）
+    if want_inline_tts and os.environ.get("POE_API_KEY", "").strip():
+        try:
+            tts_max = int(os.environ.get("CHAT_TTS_MAX_CHARS", "400") or "400")
+            if tts_max < 50:
+                tts_max = 50
+            if tts_max > 2000:
+                tts_max = 2000
+            tts_text = (reply_clean or "")[:tts_max]
+            if tts_text.strip():
+                upstream_url = _poe_tts_url(tts_text)
+                token = secrets.token_urlsafe(10)
+                _tts_cache[token] = (upstream_url, time.time())
+                proxy_url = f"/api/tts/audio/{token}"
+                out["tts_absolute_url"] = request.host_url.rstrip("/") + proxy_url
+        except Exception as e:
+            out["tts_error"] = str(e)
+
+    return jsonify(out), 200
 
 
 @app.route("/api/tts", methods=["POST"])

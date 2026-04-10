@@ -21,13 +21,17 @@
  *   SCK  -> GPIO14  (BCLK)
  *   SD   -> GPIO12  (ESP DIN / 麥克風 DOUT)
  *   L/R  -> GND 或 3.3V（選左/右聲道）；執行時也可用 Serial 指令 micL / micR 切換（與 esp32_voice_ai_robot 一致）
- * 若同時接 MAX98357A 喇叭：DIN -> GPIO11，與麥克風共用 BCLK/WS（本程式僅錄音時使用 I2S）。
+ * 若同時接 MAX98357A 喇叭：DIN -> GPIO11，與麥克風共用 BCLK/WS；ENABLE_TTS=1 時會下載 /api/tts 之 MP3 並 I2S 播放（與 esp32_voice_ai_robot 相同思路）。
+ * 可選：ENABLE_WIFI_AP=1 時額外開 SoftAP，手機連熱點可看 Serial 對應的 STA IP（ESP32-S3，非 ESP8266）。
+ * 多個 ESP32-C3：Serial 指令 udp list / udp add / udp use / udp del（見 udp help），目標存 NVS。
+ * 雲端 AI：POST /api/chat 會帶 udp_targets；模型可輸出 DEVICE_TARGET（上一行）+ DEVICE_CMD，裝置依此選 IP。
  *
  * Serial 115200；ESP32-S3 若 Serial 空白可開 Tools -> USB CDC On Boot
  */
 
 #include <Arduino.h>
 #include <string.h>
+#include <Preferences.h>
 
 #ifndef SERIAL_AI_FORCE_CLOUD
 #define SERIAL_AI_FORCE_CLOUD 1  // 1 = 全部交給雲端 AI 判斷 device_cmd
@@ -40,9 +44,26 @@
 #ifndef ENABLE_I2S_MIC
 #define ENABLE_I2S_MIC 1  // 0 = 不使用麥克風，略過 r 錄音與 ESP_I2S
 #endif
+#ifndef ENABLE_TTS
+#define ENABLE_TTS 1  // 1 = 雲端 /api/tts 經 MAX98357A 播放 AI 文字回覆（需 I2S 與喇叭）
+#endif
+#if !ENABLE_I2S_MIC
+#undef ENABLE_TTS
+#define ENABLE_TTS 0  // 無 I2S 時無法播 MP3
+#endif
 #ifndef MIC_MAX_RECORD_SECONDS
 // 與 esp32_voice_ai_robot 的 MAX_REC_SECONDS 一致（安全上限）；無 PSRAM 時分配會自動降秒數
 #define MIC_MAX_RECORD_SECONDS 5
+#endif
+
+#ifndef ENABLE_WIFI_AP
+#define ENABLE_WIFI_AP 1  // 1 = 同時開 WiFi 熱點 SoftAP（與連家裡 WiFi 的 STA 並存）
+#endif
+#ifndef AP_SSID
+#define AP_SSID "ESP32S3-AI"
+#endif
+#ifndef AP_PASS
+#define AP_PASS "12345678"  // WPA2 至少 8 字；可在 wifi_secrets.h 覆寫
 #endif
 
 #if ENABLE_I2S_MIC
@@ -56,15 +77,21 @@
 #define WIFI_SSID "GAN"
 #define WIFI_PASS "chen0605"
 #define STT_URL   "https://magicwandmain-production.up.railway.app/api/stt"
+#define TTS_URL   "https://magicwandmain-production.up.railway.app/api/tts"
 #define CHAT_URL  "https://magicwandmain-production.up.railway.app/api/chat"
 #define LOG_URL  "https://magicwandmain-production.up.railway.app/api/log"
 #define DEVICE_ID "esp32s3_ai_client_001"
 #define UDP_TARGET_IP   "10.232.188.113"
 #define UDP_TARGET_PORT 4210
+#define AP_SSID "ESP32S3-AI"
+#define AP_PASS "12345678"
 #endif
 
 #if ENABLE_I2S_MIC && !defined(STT_URL)
 #define STT_URL "https://magicwandmain-production.up.railway.app/api/stt"
+#endif
+#if ENABLE_I2S_MIC && ENABLE_TTS && !defined(TTS_URL)
+#define TTS_URL "https://magicwandmain-production.up.railway.app/api/tts"
 #endif
 
 #if ENABLE_I2S_MIC
@@ -96,6 +123,15 @@ static String g_serialLineBuf;
 static WiFiUDP g_udp;
 static IPAddress g_targetIp;
 
+#ifndef UDP_TARGET_MAX
+#define UDP_TARGET_MAX 8
+#endif
+
+static String g_udpNames[UDP_TARGET_MAX];
+static IPAddress g_udpIps[UDP_TARGET_MAX];
+static int g_udpCount = 0;
+static int g_udpCurrent = 0;
+
 static bool parseIp(const char* s, IPAddress& out) {
   int a, b, c, d;
   if (sscanf(s, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return false;
@@ -104,9 +140,330 @@ static bool parseIp(const char* s, IPAddress& out) {
   return true;
 }
 
+static void syncTargetIpFromIndex() {
+  if (g_udpCount > 0 && g_udpCurrent >= 0 && g_udpCurrent < g_udpCount) {
+    g_targetIp = g_udpIps[g_udpCurrent];
+  } else {
+    g_targetIp = IPAddress(0, 0, 0, 0);
+  }
+}
+
+static void udpPairsFromString(const String& s) {
+  g_udpCount = 0;
+  unsigned start = 0;
+  while (start < s.length() && g_udpCount < UDP_TARGET_MAX) {
+    int semi = s.indexOf(';', (int)start);
+    String seg = (semi < 0) ? s.substring(start) : s.substring(start, (unsigned)semi);
+    seg.trim();
+    if (seg.length() == 0) break;
+    int pipe = seg.indexOf('|');
+    if (pipe < 0) break;
+    String nm = seg.substring(0, pipe);
+    String ipStr = seg.substring(pipe + 1);
+    nm.trim();
+    ipStr.trim();
+    IPAddress ip;
+    if (nm.length() && parseIp(ipStr.c_str(), ip)) {
+      g_udpNames[g_udpCount] = nm;
+      g_udpIps[g_udpCount] = ip;
+      g_udpCount++;
+    }
+    if (semi < 0) break;
+    start = (unsigned)semi + 1;
+  }
+}
+
+static String udpPairsToString() {
+  String o;
+  for (int i = 0; i < g_udpCount; i++) {
+    if (i) o += ";";
+    o += g_udpNames[i];
+    o += "|";
+    o += g_udpIps[i].toString();
+  }
+  return o;
+}
+
+static void udpTargetsSave() {
+  Preferences p;
+  if (!p.begin("c3udp", false)) return;
+  p.putString("pairs", udpPairsToString());
+  p.putUInt("cur", (unsigned)g_udpCurrent);
+  p.end();
+}
+
+static void udpTargetsLoad() {
+  Preferences p;
+  if (!p.begin("c3udp", true)) {
+    g_udpCount = 0;
+    IPAddress ip;
+    if (parseIp(UDP_TARGET_IP, ip)) {
+      g_udpNames[0] = "default";
+      g_udpIps[0] = ip;
+      g_udpCount = 1;
+      g_udpCurrent = 0;
+      syncTargetIpFromIndex();
+      udpTargetsSave();
+    }
+    return;
+  }
+  String pairs = p.getString("pairs", "");
+  g_udpCurrent = (int)p.getUInt("cur", 0);
+  p.end();
+
+  if (pairs.length() == 0) {
+    g_udpCount = 0;
+    IPAddress ip;
+    if (parseIp(UDP_TARGET_IP, ip)) {
+      g_udpNames[0] = "default";
+      g_udpIps[0] = ip;
+      g_udpCount = 1;
+      g_udpCurrent = 0;
+      udpTargetsSave();
+    }
+  } else {
+    udpPairsFromString(pairs);
+    if (g_udpCount == 0) {
+      IPAddress ip;
+      if (parseIp(UDP_TARGET_IP, ip)) {
+        g_udpNames[0] = "default";
+        g_udpIps[0] = ip;
+        g_udpCount = 1;
+        g_udpCurrent = 0;
+        udpTargetsSave();
+      }
+    } else if (g_udpCurrent < 0 || g_udpCurrent >= g_udpCount) {
+      g_udpCurrent = 0;
+      udpTargetsSave();
+    }
+  }
+  syncTargetIpFromIndex();
+}
+
+static void udpPrintHelp() {
+  Serial.println("--- UDP 多個 ESP32-C3 ---");
+  Serial.println("udp list              列出已儲存目標與目前選中");
+  Serial.println("udp add <名稱> <IP>   新增（例: udp add room1 192.168.1.50）");
+  Serial.println("udp use <名稱|序號>  切換目前 UDP 目標（例: udp use 0 或 udp use room1）");
+  Serial.println("udp del <名稱|序號>  刪除一筆");
+  Serial.println("udp clear             清空並恢復 wifi_secrets 的 UDP_TARGET_IP");
+}
+
+static void udpPrintList() {
+  Serial.println("--- UDP 目標 (port=" + String(UDP_TARGET_PORT) + ") ---");
+  for (int i = 0; i < g_udpCount; i++) {
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.print(g_udpNames[i]);
+    Serial.print("  ");
+    Serial.print(g_udpIps[i]);
+    if (i == g_udpCurrent) Serial.print("  <-- 目前");
+    Serial.println();
+  }
+  Serial.print("目前送出指令 -> ");
+  Serial.print(g_targetIp);
+  Serial.print(":");
+  Serial.println(UDP_TARGET_PORT);
+}
+
+static int udpFindName(const String& name) {
+  for (int i = 0; i < g_udpCount; i++) {
+    if (g_udpNames[i].equalsIgnoreCase(name)) return i;
+  }
+  return -1;
+}
+
+/** 依 /api/chat 的 device_target 切換目前 UDP 目標；空或 NONE 表示不切換；名稱不存在回傳 false */
+static bool udpResolveAiDeviceTarget(const String& raw) {
+  String s = raw;
+  s.trim();
+  if (s.length() == 0) return true;
+  if (s.equalsIgnoreCase("none")) return true;
+  int idx = udpFindName(s);
+  if (idx < 0) {
+    Serial.print("[UDP] AI 目標名稱未找到: ");
+    Serial.println(s);
+    return false;
+  }
+  g_udpCurrent = idx;
+  udpTargetsSave();
+  syncTargetIpFromIndex();
+  Serial.print("[UDP] AI 選目標 -> ");
+  Serial.print(g_udpNames[g_udpCurrent]);
+  Serial.print(" ");
+  Serial.println(g_targetIp);
+  return true;
+}
+
+/** 是否為「列出可連接／已登記設備」查詢：本地直接 udp list，不送雲端（省流量且與 NVS 一致） */
+static bool matchDeviceListQuery(const String& line) {
+  String s = line;
+  s.trim();
+  if (s.length() == 0) return false;
+  bool hasDevice = (s.indexOf("設備") >= 0) || (s.indexOf("裝置") >= 0);
+  if (!hasDevice) return false;
+  return (s.indexOf("哪些") >= 0) || (s.indexOf("列出") >= 0) || (s.indexOf("查看") >= 0) ||
+         (s.indexOf("查詢") >= 0) || (s.indexOf("有什麼") >= 0) || (s.indexOf("可連接") >= 0) ||
+         (s.indexOf("連接") >= 0 && (s.indexOf("可以") >= 0 || s.indexOf("能") >= 0));
+}
+
+/** Serial 行以 udp 開頭則處理並回傳 true（不送 AI） */
+static bool tryHandleUdpTargetLine(const String& line) {
+  if (line.length() < 3) return false;
+  if (!line.substring(0, 3).equalsIgnoreCase("udp")) return false;
+
+  String rest = line.substring(3);
+  rest.trim();
+  if (rest.length() == 0 || rest.equalsIgnoreCase("help")) {
+    udpPrintHelp();
+    return true;
+  }
+
+  String rlow = rest;
+  rlow.toLowerCase();
+
+  if (rlow == "list") {
+    udpPrintList();
+    return true;
+  }
+
+  if (rlow == "clear") {
+    Preferences p;
+    if (p.begin("c3udp", false)) {
+      p.clear();
+      p.end();
+    }
+    g_udpCount = 0;
+    IPAddress ip;
+    if (parseIp(UDP_TARGET_IP, ip)) {
+      g_udpNames[0] = "default";
+      g_udpIps[0] = ip;
+      g_udpCount = 1;
+      g_udpCurrent = 0;
+      udpTargetsSave();
+      syncTargetIpFromIndex();
+      Serial.println("[UDP] 已清空並恢復預設 IP");
+    } else {
+      Serial.println("[UDP] clear 失敗：UDP_TARGET_IP 無效");
+    }
+    udpPrintList();
+    return true;
+  }
+
+  if (rlow.startsWith("add ")) {
+    String a = rest.substring(4);
+    a.trim();
+    int sp = a.indexOf(' ');
+    if (sp < 0) {
+      Serial.println("[UDP] 用法: udp add <名稱> <IP>");
+      return true;
+    }
+    String nm = a.substring(0, sp);
+    String ipStr = a.substring(sp + 1);
+    nm.trim();
+    ipStr.trim();
+    if (nm.length() == 0 || nm.indexOf('|') >= 0 || nm.indexOf(';') >= 0) {
+      Serial.println("[UDP] 名稱不可為空或含 | ;");
+      return true;
+    }
+    IPAddress ip;
+    if (!parseIp(ipStr.c_str(), ip)) {
+      Serial.println("[UDP] IP 格式錯誤");
+      return true;
+    }
+    int ex = udpFindName(nm);
+    if (ex >= 0) {
+      g_udpIps[ex] = ip;
+      Serial.println("[UDP] 已更新同名目標");
+    } else {
+      if (g_udpCount >= UDP_TARGET_MAX) {
+        Serial.println("[UDP] 已滿，請先 udp del");
+        return true;
+      }
+      g_udpNames[g_udpCount] = nm;
+      g_udpIps[g_udpCount] = ip;
+      g_udpCount++;
+      Serial.println("[UDP] 已新增");
+    }
+    udpTargetsSave();
+    syncTargetIpFromIndex();
+    udpPrintList();
+    return true;
+  }
+
+  if (rlow.startsWith("use ")) {
+    String u = rest.substring(4);
+    u.trim();
+    if (u.length() == 0) {
+      Serial.println("[UDP] 用法: udp use <名稱|序號>");
+      return true;
+    }
+    int idx = -1;
+    bool allDigits = true;
+    for (unsigned i = 0; i < u.length(); i++) {
+      if (u[i] < '0' || u[i] > '9') {
+        allDigits = false;
+        break;
+      }
+    }
+    if (allDigits && u.length() > 0) {
+      idx = u.toInt();
+    } else {
+      idx = udpFindName(u);
+    }
+    if (idx < 0 || idx >= g_udpCount) {
+      Serial.println("[UDP] 找不到目標");
+      return true;
+    }
+    g_udpCurrent = idx;
+    udpTargetsSave();
+    syncTargetIpFromIndex();
+    Serial.println("[UDP] 已切換");
+    udpPrintList();
+    return true;
+  }
+
+  if (rlow.startsWith("del ")) {
+    String u = rest.substring(4);
+    u.trim();
+    int idx = -1;
+    bool allDigits = true;
+    for (unsigned i = 0; i < u.length(); i++) {
+      if (u[i] < '0' || u[i] > '9') {
+        allDigits = false;
+        break;
+      }
+    }
+    if (allDigits && u.length() > 0) {
+      idx = u.toInt();
+    } else {
+      idx = udpFindName(u);
+    }
+    if (idx < 0 || idx >= g_udpCount) {
+      Serial.println("[UDP] 找不到目標");
+      return true;
+    }
+    for (int i = idx; i < g_udpCount - 1; i++) {
+      g_udpNames[i] = g_udpNames[i + 1];
+      g_udpIps[i] = g_udpIps[i + 1];
+    }
+    g_udpCount--;
+    if (g_udpCurrent >= g_udpCount) g_udpCurrent = g_udpCount - 1;
+    if (g_udpCurrent < 0) g_udpCurrent = 0;
+    udpTargetsSave();
+    syncTargetIpFromIndex();
+    Serial.println("[UDP] 已刪除");
+    udpPrintList();
+    return true;
+  }
+
+  udpPrintHelp();
+  return true;
+}
+
 static bool udpSendCommand(const char* cmd) {
   if (!g_targetIp) {
-    Serial.println("[UDP] target IP invalid — set UDP_TARGET_IP in wifi_secrets.h");
+    Serial.println("[UDP] 無有效目標 — 執行 udp list / udp add / udp use");
     return false;
   }
   g_udp.beginPacket(g_targetIp, (uint16_t)UDP_TARGET_PORT);
@@ -305,6 +662,21 @@ static String extractJsonStringField(const String& json, const char* field) {
   return out;
 }
 
+static String udpTargetsJsonArray() {
+  if (g_udpCount <= 0) return "[]";
+  String j = "[";
+  for (int i = 0; i < g_udpCount; i++) {
+    if (i) j += ",";
+    j += "{\"name\":\"";
+    j += escapeJsonString(g_udpNames[i]);
+    j += "\",\"ip\":\"";
+    j += escapeJsonString(g_udpIps[i].toString());
+    j += "\"}";
+  }
+  j += "]";
+  return j;
+}
+
 static void httpPostLogBestEffort(const String& inputText, const String& outputText, const char* kind) {
   if (!inputText.length() || !outputText.length()) return;
   WiFiClientSecure client;
@@ -326,9 +698,12 @@ static void httpPostLogBestEffort(const String& inputText, const String& outputT
   http.end();
 }
 
-static bool httpPostChat(const String& text, String& outReply, String& outDeviceCmd) {
+static bool httpPostChat(const String& text, String& outReply, String& outDeviceCmd, String& outDeviceTarget,
+                         String& outTtsUrl) {
   outReply = "";
   outDeviceCmd = "";
+  outDeviceTarget = "";
+  outTtsUrl = "";
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -339,7 +714,12 @@ static bool httpPostChat(const String& text, String& outReply, String& outDevice
   body += DEVICE_ID;
   body += "\",\"message\":\"";
   body += escapeJsonString(text);
-  body += "\"}";
+  body += "\",\"udp_targets\":";
+  body += udpTargetsJsonArray();
+#if ENABLE_I2S_MIC && ENABLE_TTS
+  body += ",\"include_tts\":true";
+#endif
+  body += "}";
   int code = http.POST(body);
   String resp = http.getString();
   http.end();
@@ -352,6 +732,8 @@ static bool httpPostChat(const String& text, String& outReply, String& outDevice
   }
   outReply = extractJsonStringField(resp, "reply");
   outDeviceCmd = extractJsonStringField(resp, "device_cmd");
+  outDeviceTarget = extractJsonStringField(resp, "device_target");
+  outTtsUrl = extractJsonStringField(resp, "tts_absolute_url");
   if (!outReply.length()) {
     Serial.println("[CHAT] missing reply");
     Serial.println(resp);
@@ -616,6 +998,157 @@ static void micFinishAndUpload() {
   Serial.println(said);
   processUserTextLine(said);
 }
+
+#if ENABLE_TTS
+static String stripForTts(const String& s) {
+  String t = s;
+  t.replace('\r', ' ');
+  t.replace('\n', ' ');
+  t.trim();
+  if (t.length() > 400) t = t.substring(0, 400);
+  return t;
+}
+
+static bool httpPostTts(const String& text, String& outAbsoluteUrl) {
+  outAbsoluteUrl = "";
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  HTTPClient http;
+  if (!http.begin(client, TTS_URL)) return false;
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(180000);
+  String body = "{\"device_id\":\"";
+  body += DEVICE_ID;
+  body += "\",\"text\":\"";
+  body += escapeJsonString(text);
+  body += "\"}";
+  int code = http.POST(body);
+  String resp = http.getString();
+  http.end();
+  if (code != 200) {
+    Serial.print("[TTS HTTP ");
+    Serial.print(code);
+    Serial.println("]");
+    Serial.println(resp);
+    return false;
+  }
+  outAbsoluteUrl = extractJsonStringField(resp, "absolute_url");
+  return outAbsoluteUrl.length() > 0;
+}
+
+static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
+  outSize = 0;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  HTTPClient http;
+  if (!http.begin(client, url)) return nullptr;
+  int code = http.GET();
+  if (code != 200) {
+    Serial.print("[TTS dl HTTP ");
+    Serial.print(code);
+    Serial.println("]");
+    http.end();
+    return nullptr;
+  }
+  int len = http.getSize();
+  const size_t kMax = 512 * 1024;
+  WiFiClient* stream = http.getStreamPtr();
+  size_t cap = (len > 0) ? (size_t)len : (64 * 1024);
+  if (cap > kMax) cap = kMax;
+  uint8_t* buf = nullptr;
+  if (ESP.getPsramSize() > 0) {
+    buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if (!buf) buf = (uint8_t*)malloc(cap);
+  if (!buf) {
+    http.end();
+    return nullptr;
+  }
+  size_t pos = 0;
+  unsigned long start = millis();
+  while (http.connected()) {
+    size_t avail = stream->available();
+    if (avail) {
+      size_t toRead = avail;
+      if (pos + toRead > cap) {
+        size_t newCap = cap * 2;
+        if (newCap < pos + toRead) newCap = pos + toRead;
+        if (newCap > kMax) {
+          free(buf);
+          http.end();
+          return nullptr;
+        }
+        uint8_t* nb = (uint8_t*)realloc(buf, newCap);
+        if (!nb) {
+          free(buf);
+          http.end();
+          return nullptr;
+        }
+        buf = nb;
+        cap = newCap;
+      }
+      int r = stream->readBytes(buf + pos, toRead);
+      if (r > 0) pos += (size_t)r;
+    } else {
+      if (millis() - start > 20000) break;
+      delay(5);
+    }
+    if (len > 0 && (int)pos >= len) break;
+  }
+  http.end();
+  outSize = pos;
+  return buf;
+}
+
+static bool i2sBeginForPlayback() {
+  I2S.end();
+  I2S.setPins(PIN_BCLK, PIN_WS, PIN_DOUT, -1, -1);
+  return I2S.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+}
+
+static void speakAiReply(const String& replyText, const String& inlineTtsUrl) {
+  String t = stripForTts(replyText);
+  if (!t.length()) return;
+
+  Serial.println("[TTS] 播放 AI 回覆…");
+  I2S.end();
+  delay(50);
+
+  String mp3Url;
+  if (inlineTtsUrl.length() > 0) {
+    mp3Url = inlineTtsUrl;
+    Serial.println("[TTS] 使用 /api/chat 內嵌網址（省一次 POST）");
+  } else if (!httpPostTts(t, mp3Url)) {
+    Serial.println("[TTS] 請求音訊 URL 失敗");
+    i2sBeginForMic();
+    return;
+  }
+
+  size_t mp3Len = 0;
+  uint8_t* mp3 = downloadMp3ToRam(mp3Url.c_str(), mp3Len);
+  if (!mp3 || mp3Len < 16) {
+    Serial.println("[TTS] MP3 下載失敗");
+    if (mp3) free(mp3);
+    i2sBeginForMic();
+    return;
+  }
+
+  if (!i2sBeginForPlayback()) {
+    Serial.println("[TTS] I2S 播放模式啟動失敗");
+    free(mp3);
+    i2sBeginForMic();
+    return;
+  }
+
+  bool ok = I2S.playMP3(mp3, mp3Len);
+  Serial.print("[TTS] playMP3=");
+  Serial.println(ok ? "ok" : "fail");
+  free(mp3);
+  i2sBeginForMic();
+}
+#endif  // ENABLE_TTS
 #endif  // ENABLE_I2S_MIC
 
 void setup() {
@@ -630,31 +1163,57 @@ void setup() {
   Serial.println("Mode: local keywords first; else /api/chat -> JSON device_cmd (ON/OFF/NONE)");
 #endif
 
+#if ENABLE_WIFI_AP
+  WiFi.mode(WIFI_AP_STA);
+#else
   WiFi.mode(WIFI_STA);
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi");
+  Serial.print("WiFi(STA)");
   while (WiFi.status() != WL_CONNECTED) {
     delay(400);
     Serial.print(".");
   }
   Serial.println();
-  Serial.print("WiFi OK  IP: ");
+  Serial.print("WiFi STA IP: ");
   Serial.println(WiFi.localIP());
 
-  if (!parseIp(UDP_TARGET_IP, g_targetIp)) {
-    Serial.println("[UDP] Invalid UDP_TARGET_IP");
+#if ENABLE_WIFI_AP
+  if (WiFi.softAP(AP_SSID, AP_PASS)) {
+    Serial.print("SoftAP SSID: ");
+    Serial.print(AP_SSID);
+    Serial.print("  IP: ");
+    Serial.println(WiFi.softAPIP());
   } else {
-    g_udp.begin(0);
-    Serial.print("[UDP] target ESP32-C3 ");
+    Serial.println("[WiFi] SoftAP 啟動失敗（檢查 AP_PASS 長度>=8）");
+  }
+#endif
+
+  udpTargetsLoad();
+  g_udp.begin(0);
+  if (!g_targetIp) {
+    Serial.println("[UDP] 無有效 C3 目標 — 請設定 wifi_secrets 的 UDP_TARGET_IP 或 Serial: udp add …");
+  } else {
+    Serial.print("[UDP] 目前指令目標 ");
     Serial.print(g_targetIp);
     Serial.print(":");
     Serial.println(UDP_TARGET_PORT);
   }
+  udpPrintList();
+  Serial.println("多個 C3：udp help；問「有哪些設備」可本地列出清單");
 
   Serial.println();
   Serial.println("輸入一行文字；輸入 r 開始錄音，再輸入 r 停止並上傳語音：");
 #if ENABLE_I2S_MIC
   Serial.println("麥克風調校（同 esp32_voice_ai_robot）: micL / micR 聲道, shift8..shift20 增益");
+#if ENABLE_TTS
+  Serial.println("TTS 喇叭: ON（POST /api/tts -> MAX98357A）");
+#else
+  Serial.println("TTS 喇叭: OFF（ENABLE_TTS=0）");
+#endif
+#endif
+#if ENABLE_WIFI_AP
+  Serial.println("WiFi 熱點(SoftAP)已開，手機可連 SSID 見上");
 #endif
 }
 
@@ -672,10 +1231,19 @@ static void processUserTextLine(const String& line) {
   }
 #endif
 
+  if (matchDeviceListQuery(line)) {
+    Serial.println("[本地] 已登記可送 UDP 指令的目標（與 udp list 相同）：");
+    udpPrintList();
+    Serial.println("[DONE]\n請繼續輸入：");
+    return;
+  }
+
   String reply;
   String deviceCmd;
+  String deviceTarget;
+  String ttsUrl;
   Serial.println("[CHAT] ...");
-  if (!httpPostChat(line, reply, deviceCmd)) {
+  if (!httpPostChat(line, reply, deviceCmd, deviceTarget, ttsUrl)) {
     Serial.println("請繼續輸入：");
     return;
   }
@@ -683,33 +1251,45 @@ static void processUserTextLine(const String& line) {
   Serial.println(reply);
   deviceCmd.toLowerCase();
   deviceCmd.trim();
+  deviceTarget.trim();
   Serial.print("[CLOUD] device_cmd=");
-  Serial.println(deviceCmd.length() ? deviceCmd : "(empty)");
+  Serial.print(deviceCmd.length() ? deviceCmd : "(empty)");
+  Serial.print("  device_target=");
+  Serial.println(deviceTarget.length() ? deviceTarget : "(unchanged)");
 
-  httpPostLogBestEffort(line, reply + " |cmd:" + deviceCmd, "chat");
+  httpPostLogBestEffort(line, reply + " |cmd:" + deviceCmd + "|tgt:" + deviceTarget, "chat");
 
-  if (deviceCmd == "on") {
+  bool targetOk = udpResolveAiDeviceTarget(deviceTarget);
+  if (!targetOk) {
+    Serial.println("[PATH] AI device_target 無效，不送出 UDP");
+  }
+
+  if (targetOk && deviceCmd == "on") {
     Serial.println("[PATH] AI device_cmd -> UDP ON");
     udpSendCommand("ON");
     httpPostLogBestEffort(line, "ON", "ai_device_cmd");
-  } else if (deviceCmd == "off") {
+  } else if (targetOk && deviceCmd == "off") {
     Serial.println("[PATH] AI device_cmd -> UDP OFF");
     udpSendCommand("OFF");
     httpPostLogBestEffort(line, "OFF", "ai_device_cmd");
-  } else if (deviceCmd == "b0" || deviceCmd == "b25" || deviceCmd == "b50" || deviceCmd == "b75" ||
-             deviceCmd == "b100") {
+  } else if (targetOk && (deviceCmd == "b0" || deviceCmd == "b25" || deviceCmd == "b50" || deviceCmd == "b75" ||
+                          deviceCmd == "b100")) {
     String u = deviceCmd;
     u.toUpperCase();
     Serial.print("[PATH] AI device_cmd -> UDP ");
     Serial.println(u);
     udpSendCommand(u.c_str());
     httpPostLogBestEffort(line, u, "ai_device_cmd");
-  } else if (matchVoiceCommand(reply, cmdUdp, say)) {
+  } else if (targetOk && matchVoiceCommand(reply, cmdUdp, say)) {
     Serial.print("[PATH] AI reply text fallback -> UDP ");
     Serial.println(cmdUdp);
     udpSendCommand(cmdUdp.c_str());
     httpPostLogBestEffort(reply, cmdUdp, "ai_udp");
   }
+
+#if ENABLE_I2S_MIC && ENABLE_TTS
+  speakAiReply(reply, ttsUrl);
+#endif
 
   Serial.println("[DONE]\n請繼續輸入：");
 }
@@ -750,6 +1330,8 @@ void loop() {
     Serial.println("[ERR] 超過 2000 字元");
     return;
   }
+
+  if (tryHandleUdpTargetLine(line)) return;
 
 #if ENABLE_I2S_MIC
   if (line.startsWith("shift")) {
