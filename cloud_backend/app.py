@@ -202,12 +202,18 @@ DEVICE_CMD: B100
 - 想關燈 → OFF；或要 0% 亮度 → B0。
 - 使用者明確說出「25%/一半略暗/四分之一亮度」等 → 對應 B25/B50/B75（依語意選最接近的一檔）。
 - 一般聊天或與燈無關 → NONE。
-- 若使用者問「有哪些設備/裝置」「可連接哪些」「列出設備」等（僅查詢、不控制燈），請依下方「已登記清單」用繁體中文簡短列出名稱與 IP，然後 DEVICE_CMD: NONE。"""
+- 若使用者問「有哪些設備/裝置」「可連接哪些」「列出設備」等（僅查詢、不控制燈），請依下方「已登記清單」用繁體中文簡短列出名稱與 IP，然後 DEVICE_CMD: NONE。
+- 若使用者要「斷開與裝置的連接／暫停用語音或指令控制」（例如：斷開連接、不要控制燈、關閉連線），在 DEVICE_CMD **之上**多輸出一行：DEVICE_LINK: DISCONNECT，且 DEVICE_CMD 通常為 NONE。
+- 若使用者要「恢復連接／允許再次控制裝置」，在 DEVICE_CMD **之上**多輸出一行：DEVICE_LINK: CONNECT（DEVICE_CMD 依是否同時要控燈而定）。
+- 若與連接狀態無關，輸出 DEVICE_LINK: NONE 或省略 DEVICE_LINK（裝置維持原狀）。
+輸出順序（從檔案最底往上）：最後一行必為 DEVICE_CMD；其上一行可為 DEVICE_TARGET（多裝置時）；再上一行可為 DEVICE_LINK。"""
 
 
 _VALID_DEVICE_CMDS = frozenset(
     {"ON", "OFF", "NONE", "B0", "B25", "B50", "B75", "B100"}
 )
+
+_VALID_DEVICE_LINKS = frozenset({"CONNECT", "DISCONNECT", "NONE"})
 
 
 def _iot_system_prompt(udp_targets: list | None) -> str:
@@ -242,12 +248,13 @@ DEVICE_TARGET: NONE
 
 
 def _split_device_reply(reply: str) -> tuple:
-    """回傳 (給使用者看的純文字, device_cmd, device_target 名稱或空字串表示不換目標)。"""
+    """回傳 (clean, device_cmd, device_target, device_link: connect|disconnect|"")。"""
     if not reply or not reply.strip():
-        return "", "NONE", ""
+        return "", "NONE", "", ""
     lines = reply.strip().splitlines()
     device_cmd = "NONE"
     device_target = ""
+    device_link = ""
     idx = len(lines) - 1
     if idx >= 0:
         last = lines[idx].strip()
@@ -267,13 +274,24 @@ def _split_device_reply(reply: str) -> tuple:
             else:
                 device_target = raw[:128]
             idx -= 1
+    if idx >= 0:
+        prev2 = lines[idx].strip()
+        pup2 = prev2.upper()
+        if pup2.startswith("DEVICE_LINK:"):
+            raw = prev2.split(":", 1)[1].strip().upper()
+            if raw in _VALID_DEVICE_LINKS:
+                if raw == "NONE" or not raw:
+                    device_link = ""
+                else:
+                    device_link = raw.lower()
+                idx -= 1
     clean = "\n".join(lines[: idx + 1]).strip()
-    return (clean if clean else "（無文字內容）"), device_cmd, device_target
+    return (clean if clean else "（無文字內容）"), device_cmd, device_target, device_link
 
 
 def _split_device_cmd_line(reply: str) -> tuple:
     """相容舊邏輯：僅解析 DEVICE_CMD。"""
-    c, cmd, _ = _split_device_reply(reply)
+    c, cmd, _, _ = _split_device_reply(reply)
     return c, cmd
 
 
@@ -318,6 +336,53 @@ def _heuristic_device_target(user_msg: str, udp_targets: list | None) -> str:
             best = name
             best_len = len(name)
     return best
+
+
+def _heuristic_device_link(user_msg: str) -> str:
+    """模擬模式：自然語言連接／斷開；回傳 connect、disconnect 或空字串。"""
+    s = (user_msg or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    # 斷開（優先於 connect，避免誤判）
+    if any(
+        x in s
+        for x in (
+            "斷開連接",
+            "斷開連線",
+            "解除連接",
+            "停止連接",
+            "暫停控制",
+            "不要控制燈",
+            "不要控制裝置",
+            "不要控制設備",
+            "關閉連接",
+            "關閉連線",
+        )
+    ):
+        return "disconnect"
+    if "斷開" in s and any(x in s for x in ("裝置", "設備", "連接", "連線", "udp")):
+        return "disconnect"
+    if "disconnect" in low and ("device" in low or "連" in s):
+        return "disconnect"
+    # 連接
+    if any(
+        x in s
+        for x in (
+            "恢復連接",
+            "恢復連線",
+            "重新連接",
+            "重新連線",
+            "允許控制",
+            "開啟連接",
+            "連接設備",
+            "連接裝置",
+        )
+    ):
+        return "connect"
+    if "connect" in low and any(x in s for x in ("裝置", "設備", "裝置", "udp")):
+        return "connect"
+    return ""
 
 
 def _load_recent_chat_history(device_id: str, max_turns: int, max_docs_cap: int = 0) -> list[dict]:
@@ -765,7 +830,7 @@ def chat():
     ESP32 Serial 測試用：上傳使用者文字，雲端運算後回傳 AI 回覆。
     JSON: { "message": "你好", "device_id": "esp32_001", "include_tts": true,
             "udp_targets": [ {"name":"客廳","ip":"192.168.1.10"}, ... ] }（後兩者可選）
-    多個 UDP 目標時，模型可輸出 DEVICE_TARGET（上一行）+ DEVICE_CMD；回應 JSON 含 device_target。
+    模型可輸出 DEVICE_LINK（connect/disconnect）與 DEVICE_TARGET、DEVICE_CMD；回應含 device_link、device_target。
     include_tts=true 且已設定 POE_API_KEY 時，同時回傳 tts_absolute_url，省裝置再 POST /api/tts。
     """
     body = request.get_json(force=True, silent=True)
@@ -816,9 +881,13 @@ def chat():
         # 無 API Key：模擬回覆，方便先測 Serial → 雲端流程
         hcmd = _heuristic_device_cmd(msg)
         htarget = _heuristic_device_target(msg, udp_targets)
-        tail = ""
+        hlink = _heuristic_device_link(msg)
+        tail_parts: list[str] = []
+        if hlink:
+            tail_parts.append(f"DEVICE_LINK: {hlink.upper()}")
         if udp_targets and len(udp_targets) > 1 and htarget:
-            tail = f"\nDEVICE_TARGET: {htarget}"
+            tail_parts.append(f"DEVICE_TARGET: {htarget}")
+        tail = ("\n" + "\n".join(tail_parts)) if tail_parts else ""
         reply = (
             f"[模擬模式] 已收到你的內容（前 80 字）：{msg[:80]}"
             + ("…" if len(msg) > 80 else "")
@@ -828,9 +897,13 @@ def chat():
         )
         mode = "mock"
 
-    reply_clean, device_cmd, device_target = _split_device_reply(reply)
+    reply_clean, device_cmd, device_target, device_link = _split_device_reply(reply)
     if device_cmd == "NONE" and mode != "mock":
         device_cmd = _heuristic_device_cmd(msg)
+    if not device_link:
+        hl = _heuristic_device_link(msg)
+        if hl:
+            device_link = hl
 
     # 可選：寫入 MongoDB（與 device_readings 分開）
     if collection is not None:
@@ -846,6 +919,8 @@ def chat():
             }
             if device_target:
                 doc["device_target"] = device_target
+            if device_link:
+                doc["device_link"] = device_link
             chat_col.insert_one(doc)
         except Exception:
             pass
@@ -855,6 +930,7 @@ def chat():
         "reply": reply_clean,
         "device_cmd": device_cmd,
         "device_target": device_target,
+        "device_link": device_link,
         "mode": mode,
     }
     # 一次請求內完成 TTS，省 ESP32 再 POST /api/tts 的往返延遲（需 POE_API_KEY）

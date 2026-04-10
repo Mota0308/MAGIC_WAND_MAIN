@@ -4,14 +4,12 @@
  * 流程：
  *   1) Serial 讀一行
  *      - 若整行為 r（不分大小寫）-> 開始 I2S 錄音；再輸入一行 r -> 停止錄音並 POST /api/stt -> 與文字指令相同流程
- *      - 否則視為文字指令（與先前相同）
- *   2) 若 SERIAL_AI_FORCE_CLOUD=0 且符合本地關鍵字 -> UDP（不經雲端）
- *   3) 否則 POST /api/chat；依 device_cmd 送 UDP
+ *      - 若以 udp 開頭 -> 僅管理目標清單（add/use/list），不經 AI
+ *      - 其餘一律 POST /api/chat，**僅依 JSON device_cmd / device_target** 送 UDP（無本地關鍵字判燈）
  *
- * C3 端請燒錄：esp32c3_udp_led_server.ino，並把本機 UDP_TARGET_IP 設為 C3 的 IP。
+ * C3 端請燒錄：esp32c3_udp_led_server.ino；預設目標可在 wifi_secrets.h 設 UDP_TARGET_IP，或開機後 Serial：udp add。
  *
- * 雲端 /api/chat 會回傳 JSON 欄位 device_cmd: ON | OFF | NONE | B0..B100。
- * 設 SERIAL_AI_FORCE_CLOUD 為 1 可略過本地關鍵字、一律走雲端 AI。
+ * 雲端 /api/chat 回傳 device_cmd、可選 device_target / device_link（connect|disconnect）；斷開後不送 UDP。
  *
  * --- INMP441（I2S 麥克風模組）與 ESP32-S3 建議接線（與 esp32_voice_ai_robot / esp32_i2s_audio_test 一致）---
  *   INMP441          ESP32-S3
@@ -23,7 +21,7 @@
  *   L/R  -> GND 或 3.3V（選左/右聲道）；執行時也可用 Serial 指令 micL / micR 切換（與 esp32_voice_ai_robot 一致）
  * 若同時接 MAX98357A 喇叭：DIN -> GPIO11，與麥克風共用 BCLK/WS；ENABLE_TTS=1 時會下載 /api/tts 之 MP3 並 I2S 播放（與 esp32_voice_ai_robot 相同思路）。
  * 可選：ENABLE_WIFI_AP=1 時額外開 SoftAP，手機連熱點可看 Serial 對應的 STA IP（ESP32-S3，非 ESP8266）。
- * 多個 ESP32-C3：Serial 指令 udp list / udp add / udp use / udp del（見 udp help），目標存 NVS。
+ * 多個 ESP32-C3：udp list / add / use / connect / disconnect / del（見 udp help），目標存 NVS；disconnect 僅暫停送 UDP。
  * 雲端 AI：POST /api/chat 會帶 udp_targets；模型可輸出 DEVICE_TARGET（上一行）+ DEVICE_CMD，裝置依此選 IP。
  *
  * Serial 115200；ESP32-S3 若 Serial 空白可開 Tools -> USB CDC On Boot
@@ -33,9 +31,6 @@
 #include <string.h>
 #include <Preferences.h>
 
-#ifndef SERIAL_AI_FORCE_CLOUD
-#define SERIAL_AI_FORCE_CLOUD 1  // 1 = 全部交給雲端 AI 判斷 device_cmd
-#endif
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -81,10 +76,15 @@
 #define CHAT_URL  "https://magicwandmain-production.up.railway.app/api/chat"
 #define LOG_URL  "https://magicwandmain-production.up.railway.app/api/log"
 #define DEVICE_ID "esp32s3_ai_client_001"
-#define UDP_TARGET_IP   "10.232.188.113"
-#define UDP_TARGET_PORT 4210
 #define AP_SSID "ESP32S3-AI"
 #define AP_PASS "12345678"
+#endif
+
+#ifndef UDP_TARGET_IP
+#define UDP_TARGET_IP ""  // 可選：在 wifi_secrets.h 覆寫；空則僅能靠 Serial「udp add」
+#endif
+#ifndef UDP_TARGET_PORT
+#define UDP_TARGET_PORT 4210
 #endif
 
 #if ENABLE_I2S_MIC && !defined(STT_URL)
@@ -131,6 +131,8 @@ static String g_udpNames[UDP_TARGET_MAX];
 static IPAddress g_udpIps[UDP_TARGET_MAX];
 static int g_udpCount = 0;
 static int g_udpCurrent = 0;
+/** false = 已斷開：不送 UDP（清單與選中仍保留；udp connect 可恢復） */
+static bool g_udpSendEnabled = true;
 
 static bool parseIp(const char* s, IPAddress& out) {
   int a, b, c, d;
@@ -189,12 +191,14 @@ static void udpTargetsSave() {
   if (!p.begin("c3udp", false)) return;
   p.putString("pairs", udpPairsToString());
   p.putUInt("cur", (unsigned)g_udpCurrent);
+  p.putBool("send", g_udpSendEnabled);
   p.end();
 }
 
 static void udpTargetsLoad() {
   Preferences p;
   if (!p.begin("c3udp", true)) {
+    g_udpSendEnabled = true;
     g_udpCount = 0;
     IPAddress ip;
     if (parseIp(UDP_TARGET_IP, ip)) {
@@ -202,13 +206,14 @@ static void udpTargetsLoad() {
       g_udpIps[0] = ip;
       g_udpCount = 1;
       g_udpCurrent = 0;
-      syncTargetIpFromIndex();
       udpTargetsSave();
     }
+    syncTargetIpFromIndex();
     return;
   }
   String pairs = p.getString("pairs", "");
   g_udpCurrent = (int)p.getUInt("cur", 0);
+  g_udpSendEnabled = p.getBool("send", true);
   p.end();
 
   if (pairs.length() == 0) {
@@ -244,9 +249,11 @@ static void udpPrintHelp() {
   Serial.println("--- UDP 多個 ESP32-C3 ---");
   Serial.println("udp list              列出已儲存目標與目前選中");
   Serial.println("udp add <名稱> <IP>   新增（例: udp add room1 192.168.1.50）");
-  Serial.println("udp use <名稱|序號>  切換目前 UDP 目標（例: udp use 0 或 udp use room1）");
+  Serial.println("udp use <名稱|序號>  切換目標並連接送出（同 connect）");
+  Serial.println("udp connect [名稱|序號]  連接：有參數時同 udp use；無參數時只恢復送出");
+  Serial.println("udp disconnect        斷開：暫停送 UDP（清單保留，之後 udp connect）");
   Serial.println("udp del <名稱|序號>  刪除一筆");
-  Serial.println("udp clear             清空並恢復 wifi_secrets 的 UDP_TARGET_IP");
+  Serial.println("udp clear             清空 NVS；若有 UDP_TARGET_IP 則恢復一筆 default");
 }
 
 static void udpPrintList() {
@@ -260,6 +267,8 @@ static void udpPrintList() {
     if (i == g_udpCurrent) Serial.print("  <-- 目前");
     Serial.println();
   }
+  Serial.print("UDP 送出: ");
+  Serial.println(g_udpSendEnabled ? "開啟（已連接）" : "關閉（已斷開，不送指令）");
   Serial.print("目前送出指令 -> ");
   Serial.print(g_targetIp);
   Serial.print(":");
@@ -271,6 +280,30 @@ static int udpFindName(const String& name) {
     if (g_udpNames[i].equalsIgnoreCase(name)) return i;
   }
   return -1;
+}
+
+/** 依名稱或序號選中目標；失敗回傳 false（不改 g_udpSendEnabled） */
+static bool udpSelectByNameOrIndex(const String& u) {
+  String u2 = u;
+  u2.trim();
+  if (u2.length() == 0) return false;
+  int idx = -1;
+  bool allDigits = true;
+  for (unsigned i = 0; i < u2.length(); i++) {
+    if (u2[i] < '0' || u2[i] > '9') {
+      allDigits = false;
+      break;
+    }
+  }
+  if (allDigits && u2.length() > 0) {
+    idx = u2.toInt();
+  } else {
+    idx = udpFindName(u2);
+  }
+  if (idx < 0 || idx >= g_udpCount) return false;
+  g_udpCurrent = idx;
+  syncTargetIpFromIndex();
+  return true;
 }
 
 /** 依 /api/chat 的 device_target 切換目前 UDP 目標；空或 NONE 表示不切換；名稱不存在回傳 false */
@@ -295,16 +328,25 @@ static bool udpResolveAiDeviceTarget(const String& raw) {
   return true;
 }
 
-/** 是否為「列出可連接／已登記設備」查詢：本地直接 udp list，不送雲端（省流量且與 NVS 一致） */
-static bool matchDeviceListQuery(const String& line) {
-  String s = line;
+/** 依 /api/chat 的 device_link：connect=允許送 UDP；disconnect=暫停送（與 Serial udp disconnect 同效果） */
+static void udpApplyAiDeviceLink(const String& raw) {
+  String s = raw;
   s.trim();
-  if (s.length() == 0) return false;
-  bool hasDevice = (s.indexOf("設備") >= 0) || (s.indexOf("裝置") >= 0);
-  if (!hasDevice) return false;
-  return (s.indexOf("哪些") >= 0) || (s.indexOf("列出") >= 0) || (s.indexOf("查看") >= 0) ||
-         (s.indexOf("查詢") >= 0) || (s.indexOf("有什麼") >= 0) || (s.indexOf("可連接") >= 0) ||
-         (s.indexOf("連接") >= 0 && (s.indexOf("可以") >= 0 || s.indexOf("能") >= 0));
+  if (s.length() == 0) return;
+  String sl = s;
+  sl.toLowerCase();
+  if (sl == "none") return;
+  if (sl == "disconnect") {
+    g_udpSendEnabled = false;
+    udpTargetsSave();
+    Serial.println("[UDP] AI：斷開連接（不送 UDP，直至 AI 或 Serial 恢復連接）");
+    return;
+  }
+  if (sl == "connect") {
+    g_udpSendEnabled = true;
+    udpTargetsSave();
+    Serial.println("[UDP] AI：恢復連接（允許送 UDP）");
+  }
 }
 
 /** Serial 行以 udp 開頭則處理並回傳 true（不送 AI） */
@@ -327,6 +369,39 @@ static bool tryHandleUdpTargetLine(const String& line) {
     return true;
   }
 
+  if (rlow == "disconnect") {
+    g_udpSendEnabled = false;
+    udpTargetsSave();
+    Serial.println("[UDP] 已斷開：暫不向裝置送 UDP（udp connect 可恢復）");
+    udpPrintList();
+    return true;
+  }
+
+  if (rlow == "connect" || rlow.startsWith("connect ")) {
+    String u = (rlow == "connect") ? "" : rest.substring(8);
+    u.trim();
+    if (u.length() == 0) {
+      if (!g_targetIp) {
+        Serial.println("[UDP] 無有效目標，請先 udp add");
+        return true;
+      }
+      g_udpSendEnabled = true;
+      udpTargetsSave();
+      Serial.println("[UDP] 已連接送出（使用目前選中目標）");
+      udpPrintList();
+      return true;
+    }
+    if (!udpSelectByNameOrIndex(u)) {
+      Serial.println("[UDP] 找不到目標");
+      return true;
+    }
+    g_udpSendEnabled = true;
+    udpTargetsSave();
+    Serial.println("[UDP] 已連接並切換目標");
+    udpPrintList();
+    return true;
+  }
+
   if (rlow == "clear") {
     Preferences p;
     if (p.begin("c3udp", false)) {
@@ -340,11 +415,15 @@ static bool tryHandleUdpTargetLine(const String& line) {
       g_udpIps[0] = ip;
       g_udpCount = 1;
       g_udpCurrent = 0;
+      g_udpSendEnabled = true;
       udpTargetsSave();
       syncTargetIpFromIndex();
       Serial.println("[UDP] 已清空並恢復預設 IP");
     } else {
-      Serial.println("[UDP] clear 失敗：UDP_TARGET_IP 無效");
+      g_udpSendEnabled = true;
+      udpTargetsSave();
+      syncTargetIpFromIndex();
+      Serial.println("[UDP] 已清空；未設定 UDP_TARGET_IP，請 udp add");
     }
     udpPrintList();
     return true;
@@ -398,27 +477,13 @@ static bool tryHandleUdpTargetLine(const String& line) {
       Serial.println("[UDP] 用法: udp use <名稱|序號>");
       return true;
     }
-    int idx = -1;
-    bool allDigits = true;
-    for (unsigned i = 0; i < u.length(); i++) {
-      if (u[i] < '0' || u[i] > '9') {
-        allDigits = false;
-        break;
-      }
-    }
-    if (allDigits && u.length() > 0) {
-      idx = u.toInt();
-    } else {
-      idx = udpFindName(u);
-    }
-    if (idx < 0 || idx >= g_udpCount) {
+    if (!udpSelectByNameOrIndex(u)) {
       Serial.println("[UDP] 找不到目標");
       return true;
     }
-    g_udpCurrent = idx;
+    g_udpSendEnabled = true;
     udpTargetsSave();
-    syncTargetIpFromIndex();
-    Serial.println("[UDP] 已切換");
+    Serial.println("[UDP] 已切換（已連接送出）");
     udpPrintList();
     return true;
   }
@@ -462,6 +527,10 @@ static bool tryHandleUdpTargetLine(const String& line) {
 }
 
 static bool udpSendCommand(const char* cmd) {
+  if (!g_udpSendEnabled) {
+    Serial.println("[UDP] 送出已關閉 — 請 udp connect 以連接並恢復");
+    return false;
+  }
   if (!g_targetIp) {
     Serial.println("[UDP] 無有效目標 — 執行 udp list / udp add / udp use");
     return false;
@@ -476,60 +545,6 @@ static bool udpSendCommand(const char* cmd) {
   Serial.print(":");
   Serial.println(UDP_TARGET_PORT);
   return ok;
-}
-
-static bool matchVoiceCommand(const String& text, String& outCmd, String& outSay) {
-  outCmd = "";
-  outSay = "";
-  String s = text;
-  s.toLowerCase();
-  s.replace(" ", "");
-
-  // 避免把「r」當成開燈關鍵字（與錄音啟停衝突）
-  if (s == "r") return false;
-
-  // 亮度（與 ESP32-C3 UDP B0/B25/... 一致；需先於 ON/OFF 以免被「開燈」誤判）
-  if (s.indexOf("100%") >= 0 || s.indexOf("最亮") >= 0 || s.indexOf("全亮") >= 0) {
-    outCmd = "B100";
-    outSay = "已設為最亮";
-    return true;
-  }
-  if (s.indexOf("75%") >= 0 || s.indexOf("七成五") >= 0) {
-    outCmd = "B75";
-    outSay = "已設為 75%";
-    return true;
-  }
-  if (s.indexOf("50%") >= 0 || s.indexOf("一半") >= 0 || s.indexOf("五成") >= 0) {
-    outCmd = "B50";
-    outSay = "已設為 50%";
-    return true;
-  }
-  if (s.indexOf("25%") >= 0 || s.indexOf("二成五") >= 0) {
-    outCmd = "B25";
-    outSay = "已設為 25%";
-    return true;
-  }
-  if (s.indexOf("最暗") >= 0 || s.indexOf("全暗") >= 0) {
-    outCmd = "B0";
-    outSay = "已設為最暗";
-    return true;
-  }
-
-  // OFF first (avoid ambiguity with phrases containing 開/關)
-  if (s.indexOf("關燈") >= 0 || s.indexOf("關掉") >= 0 || s.indexOf("關") == 0 || s.indexOf("off") >= 0) {
-    outCmd = "OFF";
-    outSay = "已關閉";
-    return true;
-  }
-  // ON: 中文口語 + 英文（與 esp32_serial_ai_robot 一致，並補常見說法）
-  if (s.indexOf("開燈") >= 0 || s.indexOf("打開") >= 0 || s.indexOf("開") == 0 || s.indexOf("on") >= 0 ||
-      s.indexOf("幫我打開") >= 0 || s.indexOf("幫開") >= 0 || s.indexOf("點亮") >= 0 || s.indexOf("點燈") >= 0 ||
-      s.indexOf("亮燈") >= 0 || s.indexOf("turnon") >= 0) {
-    outCmd = "ON";
-    outSay = "已開啟";
-    return true;
-  }
-  return false;
 }
 
 static String escapeJsonString(const String& s) {
@@ -699,10 +714,11 @@ static void httpPostLogBestEffort(const String& inputText, const String& outputT
 }
 
 static bool httpPostChat(const String& text, String& outReply, String& outDeviceCmd, String& outDeviceTarget,
-                         String& outTtsUrl) {
+                         String& outDeviceLink, String& outTtsUrl) {
   outReply = "";
   outDeviceCmd = "";
   outDeviceTarget = "";
+  outDeviceLink = "";
   outTtsUrl = "";
   WiFiClientSecure client;
   client.setInsecure();
@@ -733,6 +749,7 @@ static bool httpPostChat(const String& text, String& outReply, String& outDevice
   outReply = extractJsonStringField(resp, "reply");
   outDeviceCmd = extractJsonStringField(resp, "device_cmd");
   outDeviceTarget = extractJsonStringField(resp, "device_target");
+  outDeviceLink = extractJsonStringField(resp, "device_link");
   outTtsUrl = extractJsonStringField(resp, "tts_absolute_url");
   if (!outReply.length()) {
     Serial.println("[CHAT] missing reply");
@@ -1157,11 +1174,7 @@ void setup() {
 
   Serial.println();
   Serial.println("=== ESP32-S3 AI + UDP -> ESP32-C3 LED ===");
-#if SERIAL_AI_FORCE_CLOUD
-  Serial.println("Mode: cloud-only (SERIAL_AI_FORCE_CLOUD=1) -> device_cmd from /api/chat");
-#else
-  Serial.println("Mode: local keywords first; else /api/chat -> JSON device_cmd (ON/OFF/NONE)");
-#endif
+  Serial.println("Mode: 僅依 /api/chat 的 device_cmd / device_target 送 UDP（無本地語意判燈）");
 
 #if ENABLE_WIFI_AP
   WiFi.mode(WIFI_AP_STA);
@@ -1192,7 +1205,7 @@ void setup() {
   udpTargetsLoad();
   g_udp.begin(0);
   if (!g_targetIp) {
-    Serial.println("[UDP] 無有效 C3 目標 — 請設定 wifi_secrets 的 UDP_TARGET_IP 或 Serial: udp add …");
+    Serial.println("[UDP] 無有效 C3 目標 — 請在 wifi_secrets.h 設 UDP_TARGET_IP，或 Serial: udp add …");
   } else {
     Serial.print("[UDP] 目前指令目標 ");
     Serial.print(g_targetIp);
@@ -1200,7 +1213,7 @@ void setup() {
     Serial.println(UDP_TARGET_PORT);
   }
   udpPrintList();
-  Serial.println("多個 C3：udp help；問「有哪些設備」可本地列出清單");
+  Serial.println("多個 C3：udp help（僅設定目標；開關燈由雲端 AI 判斷）");
 
   Serial.println();
   Serial.println("輸入一行文字；輸入 r 開始錄音，再輸入 r 停止並上傳語音：");
@@ -1218,32 +1231,13 @@ void setup() {
 }
 
 static void processUserTextLine(const String& line) {
-  String cmdUdp, say;
-#if !SERIAL_AI_FORCE_CLOUD
-  if (matchVoiceCommand(line, cmdUdp, say)) {
-    Serial.print("[PATH] local keyword -> UDP ");
-    Serial.println(cmdUdp);
-    udpSendCommand(cmdUdp.c_str());
-    httpPostLogBestEffort(line, cmdUdp, "command");
-    if (say.length()) Serial.println(say);
-    Serial.println("[DONE]\n請繼續輸入：");
-    return;
-  }
-#endif
-
-  if (matchDeviceListQuery(line)) {
-    Serial.println("[本地] 已登記可送 UDP 指令的目標（與 udp list 相同）：");
-    udpPrintList();
-    Serial.println("[DONE]\n請繼續輸入：");
-    return;
-  }
-
   String reply;
   String deviceCmd;
   String deviceTarget;
+  String deviceLink;
   String ttsUrl;
   Serial.println("[CHAT] ...");
-  if (!httpPostChat(line, reply, deviceCmd, deviceTarget, ttsUrl)) {
+  if (!httpPostChat(line, reply, deviceCmd, deviceTarget, deviceLink, ttsUrl)) {
     Serial.println("請繼續輸入：");
     return;
   }
@@ -1252,12 +1246,18 @@ static void processUserTextLine(const String& line) {
   deviceCmd.toLowerCase();
   deviceCmd.trim();
   deviceTarget.trim();
+  deviceLink.trim();
   Serial.print("[CLOUD] device_cmd=");
   Serial.print(deviceCmd.length() ? deviceCmd : "(empty)");
   Serial.print("  device_target=");
-  Serial.println(deviceTarget.length() ? deviceTarget : "(unchanged)");
+  Serial.print(deviceTarget.length() ? deviceTarget : "(unchanged)");
+  Serial.print("  device_link=");
+  Serial.println(deviceLink.length() ? deviceLink : "(unchanged)");
 
-  httpPostLogBestEffort(line, reply + " |cmd:" + deviceCmd + "|tgt:" + deviceTarget, "chat");
+  httpPostLogBestEffort(line, reply + " |cmd:" + deviceCmd + "|tgt:" + deviceTarget + "|link:" + deviceLink,
+                        "chat");
+
+  udpApplyAiDeviceLink(deviceLink);
 
   bool targetOk = udpResolveAiDeviceTarget(deviceTarget);
   if (!targetOk) {
@@ -1280,11 +1280,6 @@ static void processUserTextLine(const String& line) {
     Serial.println(u);
     udpSendCommand(u.c_str());
     httpPostLogBestEffort(line, u, "ai_device_cmd");
-  } else if (targetOk && matchVoiceCommand(reply, cmdUdp, say)) {
-    Serial.print("[PATH] AI reply text fallback -> UDP ");
-    Serial.println(cmdUdp);
-    udpSendCommand(cmdUdp.c_str());
-    httpPostLogBestEffort(reply, cmdUdp, "ai_udp");
   }
 
 #if ENABLE_I2S_MIC && ENABLE_TTS
