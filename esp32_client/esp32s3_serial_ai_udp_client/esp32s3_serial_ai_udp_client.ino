@@ -1,20 +1,33 @@
 /*
- * ESP32-S3 — Serial 輸入 -> AI (/api/chat) + 可選 UDP 控制 ESP32-C3 LED
+ * ESP32-S3 — Serial 文字 或 I2S 麥克風 -> STT (/api/stt) -> AI (/api/chat) + UDP 控制 ESP32-C3 LED
  *
  * 流程：
  *   1) Serial 讀一行
- *   2) 若符合開/關燈關鍵字 -> UDP 送 ON/OFF 到 ESP32-C3（不經雲端）
- *   3) 否則 POST /api/chat；若 AI 回覆裡仍含開/關語意，再送 UDP
+ *      - 若整行為 r（不分大小寫）-> 開始 I2S 錄音；再輸入一行 r -> 停止錄音並 POST /api/stt -> 與文字指令相同流程
+ *      - 否則視為文字指令（與先前相同）
+ *   2) 若 SERIAL_AI_FORCE_CLOUD=0 且符合本地關鍵字 -> UDP（不經雲端）
+ *   3) 否則 POST /api/chat；依 device_cmd 送 UDP
  *
  * C3 端請燒錄：esp32c3_udp_led_server.ino，並把本機 UDP_TARGET_IP 設為 C3 的 IP。
  *
- * 雲端 /api/chat 會回傳 JSON 欄位 device_cmd: ON | OFF | NONE | B0 | B25 | B50 | B75 | B100（由 AI 依 system prompt 判斷亮度檔位）。
+ * 雲端 /api/chat 會回傳 JSON 欄位 device_cmd: ON | OFF | NONE | B0..B100。
  * 設 SERIAL_AI_FORCE_CLOUD 為 1 可略過本地關鍵字、一律走雲端 AI。
+ *
+ * --- INMP441（I2S 麥克風模組）與 ESP32-S3 建議接線（與 esp32_voice_ai_robot / esp32_i2s_audio_test 一致）---
+ *   INMP441          ESP32-S3
+ *   VDD  -> 3.3V   （勿接 5V）
+ *   GND  -> GND
+ *   WS   -> GPIO13  (LRCK)
+ *   SCK  -> GPIO14  (BCLK)
+ *   SD   -> GPIO12  (ESP DIN / 麥克風 DOUT)
+ *   L/R  -> GND 或 3.3V（選左/右聲道）；執行時也可用 Serial 指令 micL / micR 切換（與 esp32_voice_ai_robot 一致）
+ * 若同時接 MAX98357A 喇叭：DIN -> GPIO11，與麥克風共用 BCLK/WS（本程式僅錄音時使用 I2S）。
  *
  * Serial 115200；ESP32-S3 若 Serial 空白可開 Tools -> USB CDC On Boot
  */
 
 #include <Arduino.h>
+#include <string.h>
 
 #ifndef SERIAL_AI_FORCE_CLOUD
 #define SERIAL_AI_FORCE_CLOUD 1  // 1 = 全部交給雲端 AI 判斷 device_cmd
@@ -24,16 +37,60 @@
 #include <HTTPClient.h>
 #include <WiFiUdp.h>
 
+#ifndef ENABLE_I2S_MIC
+#define ENABLE_I2S_MIC 1  // 0 = 不使用麥克風，略過 r 錄音與 ESP_I2S
+#endif
+#ifndef MIC_MAX_RECORD_SECONDS
+// 與 esp32_voice_ai_robot 的 MAX_REC_SECONDS 一致（安全上限）；無 PSRAM 時分配會自動降秒數
+#define MIC_MAX_RECORD_SECONDS 5
+#endif
+
+#if ENABLE_I2S_MIC
+#include <ESP_I2S.h>
+#include "esp_heap_caps.h"
+#endif
+
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
 #else
 #define WIFI_SSID "GAN"
 #define WIFI_PASS "chen0605"
+#define STT_URL   "https://magicwandmain-production.up.railway.app/api/stt"
 #define CHAT_URL  "https://magicwandmain-production.up.railway.app/api/chat"
 #define LOG_URL  "https://magicwandmain-production.up.railway.app/api/log"
 #define DEVICE_ID "esp32s3_ai_client_001"
 #define UDP_TARGET_IP   "10.232.188.113"
 #define UDP_TARGET_PORT 4210
+#endif
+
+#if ENABLE_I2S_MIC && !defined(STT_URL)
+#define STT_URL "https://magicwandmain-production.up.railway.app/api/stt"
+#endif
+
+#if ENABLE_I2S_MIC
+// I2S 腳位（與 esp32_voice_ai_robot.ino 相同：INMP441 + 可選 MAX98357A）
+static const int PIN_BCLK = 14;
+static const int PIN_WS = 13;
+static const int PIN_DOUT = 11;  // -> MAX98357A DIN（僅麥克風時可不接）
+static const int PIN_DIN = 12;   // <- INMP441 SD
+
+// 音訊（與 esp32_voice_ai_robot：SAMPLE_RATE / BITS / CHANNELS / REC_CHUNK_FRAMES）
+static const uint32_t SAMPLE_RATE = 16000;
+static const uint16_t BITS_PER_SAMPLE = 16;
+static const uint16_t CHANNELS = 1;
+static const size_t REC_CHUNK_FRAMES = 256;
+static int g_recShift = 16;       // 32-bit I2S -> int16 右移，可用 shift8..shift20 調整（同 voice robot）
+static bool g_micUseRight = true; // 可用 micL / micR 切換（同 voice robot）
+
+static I2SClass I2S;
+
+static bool g_recording = false;
+static uint8_t* g_wavBuf = nullptr;
+static size_t g_wavCap = 0;
+static uint32_t g_pcmDataBytes = 0;
+static uint32_t g_recStartMs = 0;
+static uint32_t g_recMaxMs = 0;
+static String g_serialLineBuf;
 #endif
 
 static WiFiUDP g_udp;
@@ -70,6 +127,9 @@ static bool matchVoiceCommand(const String& text, String& outCmd, String& outSay
   String s = text;
   s.toLowerCase();
   s.replace(" ", "");
+
+  // 避免把「r」當成開燈關鍵字（與錄音啟停衝突）
+  if (s == "r") return false;
 
   // 亮度（與 ESP32-C3 UDP B0/B25/... 一致；需先於 ON/OFF 以免被「開燈」誤判）
   if (s.indexOf("100%") >= 0 || s.indexOf("最亮") >= 0 || s.indexOf("全亮") >= 0) {
@@ -300,6 +360,264 @@ static bool httpPostChat(const String& text, String& outReply, String& outDevice
   return true;
 }
 
+#if ENABLE_I2S_MIC
+static void writeWavHeader(uint8_t* dst, uint32_t dataBytes) {
+  const uint32_t byteRate = SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8);
+  const uint16_t blockAlign = CHANNELS * (BITS_PER_SAMPLE / 8);
+  const uint32_t riffSize = 36 + dataBytes;
+
+  auto W4 = [&](int off, uint32_t v) {
+    dst[off + 0] = (uint8_t)(v & 0xFF);
+    dst[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+    dst[off + 2] = (uint8_t)((v >> 16) & 0xFF);
+    dst[off + 3] = (uint8_t)((v >> 24) & 0xFF);
+  };
+  auto W2 = [&](int off, uint16_t v) {
+    dst[off + 0] = (uint8_t)(v & 0xFF);
+    dst[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+  };
+
+  memcpy(dst + 0, "RIFF", 4);
+  W4(4, riffSize);
+  memcpy(dst + 8, "WAVE", 4);
+  memcpy(dst + 12, "fmt ", 4);
+  W4(16, 16);
+  W2(20, 1);
+  W2(22, CHANNELS);
+  W4(24, SAMPLE_RATE);
+  W4(28, byteRate);
+  W2(32, blockAlign);
+  W2(34, BITS_PER_SAMPLE);
+  memcpy(dst + 36, "data", 4);
+  W4(40, dataBytes);
+}
+
+static bool i2sBeginForMic() {
+  // INMP441 多為 32-bit slot；與 esp32_voice_ai_robot::i2sBeginForRecord 相同
+  I2S.end();
+  I2S.setPins(PIN_BCLK, PIN_WS, PIN_DOUT, PIN_DIN);
+  return I2S.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
+}
+
+static void recFreeAbort() {
+  g_recording = false;
+  I2S.end();
+  if (g_wavBuf) {
+    free(g_wavBuf);
+    g_wavBuf = nullptr;
+  }
+  g_wavCap = 0;
+  g_pcmDataBytes = 0;
+  g_recMaxMs = 0;
+}
+
+/** 優先 PSRAM，其次內部連續塊，最後 malloc（降低錄音緩衝 malloc 失敗機率） */
+static uint8_t* allocRecordingBuffer(size_t cap) {
+  uint8_t* p = nullptr;
+  if (ESP.getPsramSize() > 0) {
+    p = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if (!p) {
+    p = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+  }
+  if (!p) {
+    p = (uint8_t*)malloc(cap);
+  }
+  return p;
+}
+
+static void printMallocHint(size_t needBytes) {
+  Serial.print("[REC] malloc 失敗，需要約 ");
+  Serial.print((unsigned)needBytes);
+  Serial.println(" bytes（WAV PCM 緩衝）");
+  Serial.print("[REC] freeHeap=");
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(" largestBlock=");
+  Serial.print((unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  if (ESP.getPsramSize() > 0) {
+    Serial.print(" psramFree=");
+    Serial.print((unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  }
+  Serial.println();
+  Serial.println("[REC] 可縮小 MIC_MAX_RECORD_SECONDS，或啟用板載 PSRAM（Arduino 選項）");
+}
+
+static bool recTryStart() {
+  if (g_recording) {
+    Serial.println("[REC] 已在錄音中");
+    return false;
+  }
+
+  int wantSec = MIC_MAX_RECORD_SECONDS;
+  if (wantSec < 1) wantSec = 1;
+  if (wantSec > 60) wantSec = 60;
+
+  g_wavBuf = nullptr;
+  g_wavCap = 0;
+  int gotSec = 0;
+  for (int sec = wantSec; sec >= 1; sec--) {
+    uint32_t maxSamples = SAMPLE_RATE * (uint32_t)sec;
+    size_t dataMax = (size_t)maxSamples * sizeof(int16_t);
+    size_t cap = 44 + dataMax;
+    uint8_t* buf = allocRecordingBuffer(cap);
+    if (buf) {
+      g_wavBuf = buf;
+      g_wavCap = cap;
+      gotSec = sec;
+      if (sec != wantSec) {
+        Serial.print("[REC] 記憶體不足，已自動改為最長 ");
+        Serial.print(sec);
+        Serial.println(" 秒");
+      }
+      break;
+    }
+  }
+
+  if (!g_wavBuf) {
+    size_t need1 = 44 + (size_t)SAMPLE_RATE * sizeof(int16_t);
+    printMallocHint(need1);
+    return false;
+  }
+
+  g_recMaxMs = (uint32_t)gotSec * 1000UL;
+  g_pcmDataBytes = 0;
+  writeWavHeader(g_wavBuf, 0);
+  if (!i2sBeginForMic()) {
+    Serial.println("[REC] I2S 開始失敗");
+    free(g_wavBuf);
+    g_wavBuf = nullptr;
+    g_wavCap = 0;
+    return false;
+  }
+  delay(200);
+  g_recording = true;
+  g_recStartMs = millis();
+  g_serialLineBuf = "";
+  Serial.println("[REC] 錄音中… 再輸入 r + Enter 停止並上傳（或達最長時間自動停止）");
+  return true;
+}
+
+static void recPump() {
+  if (!g_recording || !g_wavBuf) return;
+  size_t maxPcm = g_wavCap - 44;
+  if (g_pcmDataBytes >= maxPcm) return;
+
+  int32_t tmp[REC_CHUNK_FRAMES * 2];
+  size_t spacePcm = maxPcm - g_pcmDataBytes;
+  size_t maxSamples = spacePcm / sizeof(int16_t);
+  size_t chunk = maxSamples < REC_CHUNK_FRAMES ? maxSamples : REC_CHUNK_FRAMES;
+  if (chunk == 0) return;
+
+  size_t got = I2S.readBytes((char*)tmp, chunk * sizeof(int32_t) * 2);
+  if (!got) return;
+
+  int16_t* dst = (int16_t*)(g_wavBuf + 44 + g_pcmDataBytes);
+  size_t frames = got / (sizeof(int32_t) * 2);
+  size_t outN = 0;
+  for (size_t i = 0; i < frames; i++) {
+    if (g_pcmDataBytes + (outN + 1) * sizeof(int16_t) > maxPcm) break;
+    int32_t l = tmp[i * 2 + 0];
+    int32_t r = tmp[i * 2 + 1];
+    int32_t s32 = g_micUseRight ? r : l;
+    int32_t v = s32 >> g_recShift;
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    dst[outN++] = (int16_t)v;
+  }
+  g_pcmDataBytes += outN * sizeof(int16_t);
+}
+
+/** 錄音中呼叫：非阻塞讀 Serial，若收到單獨一行 r 則回傳 true */
+static bool pollSerialRecordingStop() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      String t = g_serialLineBuf;
+      g_serialLineBuf = "";
+      t.trim();
+      if (t.length() == 1 && (t[0] == 'r' || t[0] == 'R')) return true;
+      if (t.length() > 0) {
+        Serial.println("[REC] 停止請只輸入 r（已忽略此行）");
+      }
+      continue;
+    }
+    if (g_serialLineBuf.length() < 32) g_serialLineBuf += c;
+  }
+  return false;
+}
+
+static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
+  outText = "";
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  HTTPClient http;
+  if (!http.begin(client, STT_URL)) return false;
+  http.addHeader("Content-Type", "audio/wav");
+  http.setTimeout(180000);
+  int code = http.POST((uint8_t*)wav, wavLen);
+  String resp = http.getString();
+  http.end();
+  if (code != 200) {
+    Serial.print("[STT HTTP ");
+    Serial.print(code);
+    Serial.println("]");
+    Serial.println(resp);
+    return false;
+  }
+  outText = extractJsonStringField(resp, "text");
+  return outText.length() > 0;
+}
+
+static void processUserTextLine(const String& line);
+
+static void micFinishAndUpload() {
+  g_recording = false;
+  g_recMaxMs = 0;
+  I2S.end();
+  if (!g_wavBuf) {
+    g_pcmDataBytes = 0;
+    return;
+  }
+  const uint32_t minBytes = (uint32_t)(SAMPLE_RATE / 2) * (uint32_t)sizeof(int16_t);
+  if (g_pcmDataBytes < minBytes) {
+    Serial.println("[REC] 錄音太短，已取消");
+    free(g_wavBuf);
+    g_wavBuf = nullptr;
+    g_wavCap = 0;
+    g_pcmDataBytes = 0;
+    Serial.println("請繼續輸入：");
+    return;
+  }
+  writeWavHeader(g_wavBuf, g_pcmDataBytes);
+  const size_t wavLen = 44 + (size_t)g_pcmDataBytes;
+  String said;
+  if (!httpPostStt(g_wavBuf, wavLen, said)) {
+    Serial.println("[REC] STT 失敗（檢查 STT_URL、WiFi、後端金鑰）");
+    free(g_wavBuf);
+    g_wavBuf = nullptr;
+    g_wavCap = 0;
+    g_pcmDataBytes = 0;
+    Serial.println("請繼續輸入：");
+    return;
+  }
+  free(g_wavBuf);
+  g_wavBuf = nullptr;
+  g_wavCap = 0;
+  g_pcmDataBytes = 0;
+  said.trim();
+  if (said.length() == 0) {
+    Serial.println("[REC] 辨識為空");
+    Serial.println("請繼續輸入：");
+    return;
+  }
+  Serial.print("[YOU voice] ");
+  Serial.println(said);
+  processUserTextLine(said);
+}
+#endif  // ENABLE_I2S_MIC
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -334,26 +652,13 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println("輸入一行文字：");
+  Serial.println("輸入一行文字；輸入 r 開始錄音，再輸入 r 停止並上傳語音：");
+#if ENABLE_I2S_MIC
+  Serial.println("麥克風調校（同 esp32_voice_ai_robot）: micL / micR 聲道, shift8..shift20 增益");
+#endif
 }
 
-void loop() {
-  if (!Serial.available()) {
-    delay(10);
-    return;
-  }
-
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return;
-  if (line.length() > 2000) {
-    Serial.println("[ERR] 超過 2000 字元");
-    return;
-  }
-
-  Serial.print("[YOU] ");
-  Serial.println(line);
-
+static void processUserTextLine(const String& line) {
   String cmdUdp, say;
 #if !SERIAL_AI_FORCE_CLOUD
   if (matchVoiceCommand(line, cmdUdp, say)) {
@@ -407,4 +712,83 @@ void loop() {
   }
 
   Serial.println("[DONE]\n請繼續輸入：");
+}
+
+void loop() {
+#if ENABLE_I2S_MIC
+  if (g_recording) {
+    recPump();
+    if (g_wavBuf && g_pcmDataBytes >= g_wavCap - 44) {
+      Serial.println("[REC] 緩衝已滿，停止並上傳");
+      micFinishAndUpload();
+      return;
+    }
+    if (g_recMaxMs > 0 && millis() - g_recStartMs >= g_recMaxMs) {
+      Serial.println("[REC] 已達最長錄音時間，自動停止並上傳");
+      micFinishAndUpload();
+      return;
+    }
+    if (pollSerialRecordingStop()) {
+      Serial.println("[REC] 停止，上傳 STT…");
+      micFinishAndUpload();
+      return;
+    }
+    delay(1);
+    return;
+  }
+#endif
+
+  if (!Serial.available()) {
+    delay(10);
+    return;
+  }
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  if (line.length() > 2000) {
+    Serial.println("[ERR] 超過 2000 字元");
+    return;
+  }
+
+#if ENABLE_I2S_MIC
+  if (line.startsWith("shift")) {
+    int v = line.substring(5).toInt();
+    if (v >= 8 && v <= 20) {
+      g_recShift = v;
+      Serial.print("[CFG] g_recShift=");
+      Serial.println(g_recShift);
+    } else {
+      Serial.println("[CFG] 用法: shift8 .. shift20（與 esp32_voice_ai_robot）");
+    }
+    return;
+  }
+  if (line == "micL" || line == "micl") {
+    g_micUseRight = false;
+    Serial.println("[CFG] mic channel = LEFT");
+    return;
+  }
+  if (line == "micR" || line == "micr") {
+    g_micUseRight = true;
+    Serial.println("[CFG] mic channel = RIGHT");
+    return;
+  }
+#endif
+
+#if ENABLE_I2S_MIC
+  {
+    String key = line;
+    key.toLowerCase();
+    if (key == "r") {
+      if (!recTryStart()) {
+        Serial.println("請繼續輸入：");
+      }
+      return;
+    }
+  }
+#endif
+
+  Serial.print("[YOU] ");
+  Serial.println(line);
+  processUserTextLine(line);
 }

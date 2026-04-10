@@ -250,29 +250,43 @@ def _heuristic_device_cmd(user_msg: str) -> str:
     return "NONE"
 
 
-def _load_recent_chat_history(device_id: str, max_turns: int) -> list[dict]:
+def _load_recent_chat_history(device_id: str, max_turns: int, max_docs_cap: int = 0) -> list[dict]:
     """
-    從 MongoDB chat_logs 讀取最近 max_turns 輪對話（每輪包含 user + assistant）。
-    回傳 OpenAI messages 格式的 list[dict]，不包含 system 與本次 user 訊息。
-    MongoDB 未連線時回傳空陣列。
+    從 MongoDB chat_logs 讀取對話紀錄（每筆含 user_message + ai_reply），組成 OpenAI messages。
+    不包含 system 與「本次」user 訊息。
+
+    max_turns:
+      - > 0 : 只取時間上最新的 max_turns 筆（與先前行為一致）
+      - 0   : 「盡可能讀全部」— 見 max_docs_cap
+      - < 0 : 不載入歷史
+
+    max_docs_cap（僅在 max_turns==0 時有效）:
+      - 0   : 不限制筆數（該 device_id 在 chat_logs 裡全部讀出；資料量大時可能超時或超模型 token）
+      - > 0 : 只取「最新」這麼多筆（等同全部裡的安全上限）
     """
     if client is None:
         return []
-    if max_turns <= 0:
+    if max_turns < 0:
         return []
     did = (device_id or "serial_chat").strip()[:128]
     try:
         chat_col = client[DB_NAME]["chat_logs"]
-        cur = (
-            chat_col.find({"device_id": did}, {"user_message": 1, "ai_reply": 1, "timestamp": 1})
-            .sort("timestamp", -1)
-            .limit(int(max_turns))
-        )
-        docs = list(cur)
+        proj = {"user_message": 1, "ai_reply": 1, "timestamp": 1}
+        if max_turns > 0:
+            cur = chat_col.find({"device_id": did}, proj).sort("timestamp", -1).limit(int(max_turns))
+            docs = list(cur)
+            docs.reverse()  # oldest -> newest
+        else:
+            # max_turns == 0：讀全部或「最新 N 筆」上限
+            if max_docs_cap and max_docs_cap > 0:
+                cur = chat_col.find({"device_id": did}, proj).sort("timestamp", -1).limit(int(max_docs_cap))
+                docs = list(cur)
+                docs.reverse()
+            else:
+                cur = chat_col.find({"device_id": did}, proj).sort("timestamp", 1)
+                docs = list(cur)
     except Exception:
         return []
-
-    docs.reverse()  # oldest -> newest
     msgs: list[dict] = []
     for d in docs:
         um = (d.get("user_message") or "").strip()
@@ -287,7 +301,11 @@ def _load_recent_chat_history(device_id: str, max_turns: int) -> list[dict]:
 def _build_chat_messages(device_id: str, user_text: str, system_prompt: str | None) -> list[dict]:
     sys_content = system_prompt or "你是簡短、友善的助手，用繁體中文回答，盡量精簡。"
     max_turns = int(os.environ.get("CHAT_MEMORY_TURNS", "8") or "8")
-    history = _load_recent_chat_history(device_id, max_turns=max_turns)
+    # CHAT_MEMORY_MAX_DOCS：CHAT_MEMORY_TURNS=0 時，最多載入幾筆（0=不限制＝真的全撈）
+    max_docs_cap = int(os.environ.get("CHAT_MEMORY_MAX_DOCS", "0") or "0")
+    history = _load_recent_chat_history(
+        device_id, max_turns=max_turns, max_docs_cap=max_docs_cap
+    )
     return [{"role": "system", "content": sys_content}] + history + [{"role": "user", "content": (user_text or "")[:8000]}]
 
 
