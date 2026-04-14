@@ -1014,13 +1014,18 @@ def stt():
         return jsonify({"ok": False, "error": "Missing WAV audio"}), 400
 
     try:
+        timeout_sec = float(os.environ.get("STT_TIMEOUT_SEC", "45") or "45")
+        if timeout_sec < 5:
+            timeout_sec = 5.0
         # Prefer Poe STT if configured; else fall back to OpenAI STT.
         if os.environ.get("POE_API_KEY", "").strip():
-            text = _poe_stt_wav(wav_bytes)
+            text = _run_with_timeout(lambda: _poe_stt_wav(wav_bytes), timeout_sec=timeout_sec)
             mode = "poe"
         else:
-            text = _openai_stt_wav(wav_bytes)
+            text = _run_with_timeout(lambda: _openai_stt_wav(wav_bytes), timeout_sec=timeout_sec)
             mode = "openai"
+    except concurrent.futures.TimeoutError:
+        return jsonify({"ok": False, "error": "STT timeout"}), 504
     except Exception as e:
         # No key or upstream error -> mock (keeps the pipeline testable)
         text = "[模擬STT] 已收到音訊（bytes=%d）。請在 Railway 設定 OPENAI_API_KEY 以啟用真實語音辨識。" % len(wav_bytes)

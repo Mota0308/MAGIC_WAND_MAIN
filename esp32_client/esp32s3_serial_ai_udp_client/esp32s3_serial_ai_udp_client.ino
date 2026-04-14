@@ -1,32 +1,3 @@
-/*
- * ESP32-S3 — Serial 文字 或 I2S 麥克風 -> STT (/api/stt) -> AI (/api/chat) + UDP 控制 ESP32-C3 LED
- *
- * 流程：
- *   1) Serial 讀一行
- *      - 若整行為 r（不分大小寫）-> 開始 I2S 錄音；再輸入一行 r -> 停止錄音並 POST /api/stt -> 與文字指令相同流程
- *      - 若以 udp 開頭 -> 僅管理目標清單（add/use/list），不經 AI
- *      - 其餘一律 POST /api/chat，**僅依 JSON device_cmd / device_target** 送 UDP（無本地關鍵字判燈）
- *
- * C3 端請燒錄：esp32c3_udp_led_server.ino；預設目標可在 wifi_secrets.h 設 UDP_TARGET_IP，或開機後 Serial：udp add。
- *
- * 雲端 /api/chat 回傳 device_cmd、可選 device_target / device_link（connect|disconnect）；斷開後不送 UDP。
- *
- * --- INMP441（I2S 麥克風模組）與 ESP32-S3 建議接線（與 esp32_voice_ai_robot / esp32_i2s_audio_test 一致）---
- *   INMP441          ESP32-S3
- *   VDD  -> 3.3V   （勿接 5V）
- *   GND  -> GND
- *   WS   -> GPIO13  (LRCK)
- *   SCK  -> GPIO14  (BCLK)
- *   SD   -> GPIO12  (ESP DIN / 麥克風 DOUT)
- *   L/R  -> GND 或 3.3V（選左/右聲道）；執行時也可用 Serial 指令 micL / micR 切換（與 esp32_voice_ai_robot 一致）
- * 若同時接 MAX98357A 喇叭：DIN -> GPIO11，與麥克風共用 BCLK/WS；ENABLE_TTS=1 時會下載 /api/tts 之 MP3 並 I2S 播放（與 esp32_voice_ai_robot 相同思路）。
- * 可選：ENABLE_WIFI_AP=1 時額外開 SoftAP，手機連熱點可看 Serial 對應的 STA IP（ESP32-S3，非 ESP8266）。
- * 多個 ESP32-C3：udp list / add / use / connect / disconnect / del（見 udp help），目標存 NVS；disconnect 僅暫停送 UDP。
- * 雲端 AI：POST /api/chat 會帶 udp_targets；模型可輸出 DEVICE_TARGET（上一行）+ DEVICE_CMD，裝置依此選 IP。
- *
- * Serial 115200；ESP32-S3 若 Serial 空白可開 Tools -> USB CDC On Boot
- */
-
 #include <Arduino.h>
 #include <string.h>
 #include <Preferences.h>
@@ -36,29 +7,33 @@
 #include <HTTPClient.h>
 #include <WiFiUdp.h>
 
+#ifndef ENABLE_BLE_CLIENT
+// Disable by default to reduce flash usage.
+#define ENABLE_BLE_CLIENT 0
+#endif
+#if ENABLE_BLE_CLIENT
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEClient.h>
+#include <BLERemoteService.h>
+#include <BLERemoteCharacteristic.h>
+#endif
+
 #ifndef ENABLE_I2S_MIC
-#define ENABLE_I2S_MIC 1  // 0 = 不使用麥克風，略過 r 錄音與 ESP_I2S
+// Disable by default to reduce flash usage.
+#define ENABLE_I2S_MIC 1
 #endif
 #ifndef ENABLE_TTS
-#define ENABLE_TTS 1  // 1 = 雲端 /api/tts 經 MAX98357A 播放 AI 文字回覆（需 I2S 與喇叭）
+// Disable by default to reduce flash usage.
+#define ENABLE_TTS 0
 #endif
 #if !ENABLE_I2S_MIC
 #undef ENABLE_TTS
-#define ENABLE_TTS 0  // 無 I2S 時無法播 MP3
+#define ENABLE_TTS 0
 #endif
 #ifndef MIC_MAX_RECORD_SECONDS
-// 與 esp32_voice_ai_robot 的 MAX_REC_SECONDS 一致（安全上限）；無 PSRAM 時分配會自動降秒數
 #define MIC_MAX_RECORD_SECONDS 5
-#endif
-
-#ifndef ENABLE_WIFI_AP
-#define ENABLE_WIFI_AP 1  // 1 = 同時開 WiFi 熱點 SoftAP（與連家裡 WiFi 的 STA 並存）
-#endif
-#ifndef AP_SSID
-#define AP_SSID "ESP32S3-AI"
-#endif
-#ifndef AP_PASS
-#define AP_PASS "12345678"  // WPA2 至少 8 字；可在 wifi_secrets.h 覆寫
 #endif
 
 #if ENABLE_I2S_MIC
@@ -76,15 +51,25 @@
 #define CHAT_URL  "https://magicwandmain-production.up.railway.app/api/chat"
 #define LOG_URL  "https://magicwandmain-production.up.railway.app/api/log"
 #define DEVICE_ID "esp32s3_ai_client_001"
-#define AP_SSID "ESP32S3-AI"
-#define AP_PASS "12345678"
 #endif
 
 #ifndef UDP_TARGET_IP
-#define UDP_TARGET_IP ""  // 可選：在 wifi_secrets.h 覆寫；空則僅能靠 Serial「udp add」
+#define UDP_TARGET_IP "10.232.188.113"
 #endif
 #ifndef UDP_TARGET_PORT
-#define UDP_TARGET_PORT 4210
+#define UDP_TARGET_PORT 4211
+#endif
+
+// PC sends natural-language lines over WiFi UDP here (same pipeline as Serial -> processUserTextLine).
+// Must differ from C3 command port (UDP_TARGET_PORT).
+#ifndef S3_PC_CMD_UDP_PORT
+#define S3_PC_CMD_UDP_PORT 4209
+#endif
+
+// Fixed local port for the socket used to talk to C3 (S3 -> C3 UDP). Using begin(0) (random source port)
+// can make C3 replies unreliable on some builds; C3 always replies to remoteIP:remotePort of the request.
+#ifndef S3_C3_UDP_LOCAL_PORT
+#define S3_C3_UDP_LOCAL_PORT 4213
 #endif
 
 #if ENABLE_I2S_MIC && !defined(STT_URL)
@@ -95,19 +80,17 @@
 #endif
 
 #if ENABLE_I2S_MIC
-// I2S 腳位（與 esp32_voice_ai_robot.ino 相同：INMP441 + 可選 MAX98357A）
 static const int PIN_BCLK = 14;
 static const int PIN_WS = 13;
-static const int PIN_DOUT = 11;  // -> MAX98357A DIN（僅麥克風時可不接）
-static const int PIN_DIN = 12;   // <- INMP441 SD
+static const int PIN_DOUT = 11;
+static const int PIN_DIN = 12;
 
-// 音訊（與 esp32_voice_ai_robot：SAMPLE_RATE / BITS / CHANNELS / REC_CHUNK_FRAMES）
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
 static const uint16_t CHANNELS = 1;
 static const size_t REC_CHUNK_FRAMES = 256;
-static int g_recShift = 16;       // 32-bit I2S -> int16 右移，可用 shift8..shift20 調整（同 voice robot）
-static bool g_micUseRight = true; // 可用 micL / micR 切換（同 voice robot）
+static int g_recShift = 16;
+static bool g_micUseRight = true;
 
 static I2SClass I2S;
 
@@ -121,7 +104,15 @@ static String g_serialLineBuf;
 #endif
 
 static WiFiUDP g_udp;
+static WiFiUDP g_udpPcCmd;
 static IPAddress g_targetIp;
+
+// When processUserTextLine() is triggered from pollWifiPcCommand(), reply with AI text over UDP.
+static IPAddress g_wifiPcReplyIp;
+static uint16_t g_wifiPcReplyPort = 0;
+
+// Avoid large stack allocations in loopTask (can trigger stack canary / Guru Meditation).
+static char g_pcUdpBuf[2048];
 
 #ifndef UDP_TARGET_MAX
 #define UDP_TARGET_MAX 8
@@ -131,8 +122,155 @@ static String g_udpNames[UDP_TARGET_MAX];
 static IPAddress g_udpIps[UDP_TARGET_MAX];
 static int g_udpCount = 0;
 static int g_udpCurrent = 0;
-/** false = 已斷開：不送 UDP（清單與選中仍保留；udp connect 可恢復） */
 static bool g_udpSendEnabled = true;
+
+static bool g_run_wifi = true;
+static bool g_run_ble = true;
+static bool g_run_mic = true;
+
+static bool g_udpSockStarted = false;
+static bool g_udpPcCmdStarted = false;
+static uint32_t g_wifiRetryAtMs = 0;
+
+static void wifiTick() {
+  if (!g_run_wifi) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!g_udpSockStarted) {
+      if (!g_udp.begin((uint16_t)S3_C3_UDP_LOCAL_PORT)) {
+        Serial.println("[BOOT] WARN: g_udp fixed port bind failed; using ephemeral port");
+        g_udp.begin(0);
+      }
+      g_udpSockStarted = true;
+      g_udpPcCmd.begin((uint16_t)S3_PC_CMD_UDP_PORT);
+      g_udpPcCmdStarted = true;
+      Serial.print("[BOOT] WiFi STA IP: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("[BOOT] C3 command UDP local port: ");
+      Serial.println((unsigned)S3_C3_UDP_LOCAL_PORT);
+      Serial.print("[BOOT] PC text (UDP) listen port: ");
+      Serial.println((unsigned)S3_PC_CMD_UDP_PORT);
+    }
+    return;
+  }
+
+  if (g_udpSockStarted) {
+    g_udp.stop();
+    g_udpSockStarted = false;
+  }
+  if (g_udpPcCmdStarted) {
+    g_udpPcCmd.stop();
+    g_udpPcCmdStarted = false;
+  }
+
+  uint32_t now = millis();
+  if (now < g_wifiRetryAtMs) return;
+  g_wifiRetryAtMs = now + 5000;
+
+  Serial.println("[WiFi] reconnect...");
+  WiFi.disconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+#if ENABLE_BLE_CLIENT
+static const char* BLE_PEER_NAME = "MagicWand-C3";
+static const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char* NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+static BLEClient* g_bleClient = nullptr;
+static BLERemoteCharacteristic* g_bleRxChar = nullptr;
+static bool g_bleConnected = false;
+static uint32_t g_bleLastScanMs = 0;
+static BLEAddress* g_blePendingAddr = nullptr;
+
+class BleClientCallbacks : public BLEClientCallbacks {
+  void onDisconnect(BLEClient* c) {
+    (void)c;
+    g_bleConnected = false;
+    g_bleRxChar = nullptr;
+    Serial.println("[BLE] disconnected");
+  }
+};
+static BleClientCallbacks g_bleClientCb;
+
+class BleAdvCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (!advertisedDevice.haveName()) return;
+    if (strcmp(advertisedDevice.getName().c_str(), BLE_PEER_NAME) != 0) return;
+    BLEDevice::getScan()->stop();
+    if (g_blePendingAddr) {
+      delete g_blePendingAddr;
+      g_blePendingAddr = nullptr;
+    }
+    g_blePendingAddr = new BLEAddress(advertisedDevice.getAddress());
+  }
+};
+static BleAdvCallbacks g_bleAdvCb;
+
+static bool bleConnectToAddress(const BLEAddress& addr) {
+  if (!g_bleClient) return false;
+  if (!g_bleClient->connect(addr)) {
+    Serial.println("[BLE] connect failed");
+    return false;
+  }
+  BLERemoteService* svc = g_bleClient->getService(NUS_SERVICE_UUID);
+  if (!svc) {
+    Serial.println("[BLE] NUS service not found");
+    g_bleClient->disconnect();
+    return false;
+  }
+  g_bleRxChar = svc->getCharacteristic(NUS_RX_UUID);
+  if (!g_bleRxChar) {
+    Serial.println("[BLE] RX characteristic not found");
+    g_bleClient->disconnect();
+    return false;
+  }
+  g_bleConnected = true;
+  Serial.println("[BLE] connected — same payload as UDP (ON/OFF/Bxx)");
+  return true;
+}
+
+static void bleMirrorCommand(const char* cmd) {
+  if (!g_run_ble) return;
+  if (!g_udpSendEnabled) return;
+  if (!g_bleConnected || !g_bleRxChar) return;
+  size_t len = strlen(cmd);
+  if (len == 0 || len > 64) return;
+  g_bleRxChar->writeValue((uint8_t*)cmd, len, false);
+  Serial.print("[BLE] ");
+  Serial.println(cmd);
+}
+
+static void bleClientInit() {
+  BLEDevice::init("");
+  g_bleClient = BLEDevice::createClient();
+  g_bleClient->setClientCallbacks(&g_bleClientCb);
+  Serial.println("[BOOT] BLE client (Bluedroid): scan for \"" + String(BLE_PEER_NAME) + "\"");
+}
+
+static void bleClientTick() {
+  if (g_bleConnected) return;
+  uint32_t now = millis();
+  if (now - g_bleLastScanMs < 8000) return;
+  g_bleLastScanMs = now;
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(&g_bleAdvCb, false);
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+  g_blePendingAddr = nullptr;
+  scan->start(5, false);
+  if (g_blePendingAddr) {
+    if (bleConnectToAddress(*g_blePendingAddr)) {
+      delete g_blePendingAddr;
+      g_blePendingAddr = nullptr;
+      return;
+    }
+    delete g_blePendingAddr;
+    g_blePendingAddr = nullptr;
+  }
+}
+#endif
 
 static bool parseIp(const char* s, IPAddress& out) {
   int a, b, c, d;
@@ -282,7 +420,6 @@ static int udpFindName(const String& name) {
   return -1;
 }
 
-/** 依名稱或序號選中目標；失敗回傳 false（不改 g_udpSendEnabled） */
 static bool udpSelectByNameOrIndex(const String& u) {
   String u2 = u;
   u2.trim();
@@ -306,7 +443,6 @@ static bool udpSelectByNameOrIndex(const String& u) {
   return true;
 }
 
-/** 依 /api/chat 的 device_target 切換目前 UDP 目標；空或 NONE 表示不切換；名稱不存在回傳 false */
 static bool udpResolveAiDeviceTarget(const String& raw) {
   String s = raw;
   s.trim();
@@ -328,7 +464,6 @@ static bool udpResolveAiDeviceTarget(const String& raw) {
   return true;
 }
 
-/** 依 /api/chat 的 device_link：connect=允許送 UDP；disconnect=暫停送（與 Serial udp disconnect 同效果） */
 static void udpApplyAiDeviceLink(const String& raw) {
   String s = raw;
   s.trim();
@@ -349,7 +484,6 @@ static void udpApplyAiDeviceLink(const String& raw) {
   }
 }
 
-/** Serial 行以 udp 開頭則處理並回傳 true（不送 AI） */
 static bool tryHandleUdpTargetLine(const String& line) {
   if (line.length() < 3) return false;
   if (!line.substring(0, 3).equalsIgnoreCase("udp")) return false;
@@ -531,20 +665,193 @@ static bool udpSendCommand(const char* cmd) {
     Serial.println("[UDP] 送出已關閉 — 請 udp connect 以連接並恢復");
     return false;
   }
-  if (!g_targetIp) {
+  bool udpOk = false;
+  if (g_run_wifi && WiFi.status() == WL_CONNECTED && g_targetIp) {
+    g_udp.beginPacket(g_targetIp, (uint16_t)UDP_TARGET_PORT);
+    g_udp.print(cmd);
+    udpOk = g_udp.endPacket();
+    Serial.print("[UDP] ");
+    Serial.print(cmd);
+    Serial.print(" -> ");
+    Serial.print(g_targetIp);
+    Serial.print(":");
+    Serial.println(UDP_TARGET_PORT);
+  } else if (g_run_wifi && WiFi.status() == WL_CONNECTED && !g_targetIp) {
     Serial.println("[UDP] 無有效目標 — 執行 udp list / udp add / udp use");
+  }
+  return udpOk;
+}
+
+static bool udpSendCommandWaitAck(const char* cmd, unsigned long timeoutMs) {
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return false;
+  if (!g_targetIp) return false;
+
+  while (g_udp.parsePacket() > 0) {
+    char tmp[32];
+    (void)g_udp.read(tmp, (int)sizeof(tmp));
+    delay(0);
+  }
+
+  bool sent = udpSendCommand(cmd);
+  if (!sent) return false;
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    int p = g_udp.parsePacket();
+    if (p > 0) {
+      IPAddress rip = g_udp.remoteIP();
+      char buf[64];
+      int n = g_udp.read(buf, (int)sizeof(buf) - 1);
+      if (n > 0) {
+        buf[n] = '\0';
+        if (rip == g_targetIp && (strncmp(buf, "OK", 2) == 0)) {
+          Serial.print("[ACK] ");
+          Serial.println(buf);
+          return true;
+        }
+      }
+    }
+    delay(2);
+  }
+  return false;
+}
+
+static bool deviceSendCommandAuto(const char* cmd) {
+  if (!g_udpSendEnabled) {
+    Serial.println("[PATH] 已斷開（udp disconnect）— 不送指令");
     return false;
   }
-  g_udp.beginPacket(g_targetIp, (uint16_t)UDP_TARGET_PORT);
-  g_udp.print(cmd);
-  bool ok = g_udp.endPacket();
-  Serial.print("[UDP] ");
-  Serial.print(cmd);
-  Serial.print(" -> ");
-  Serial.print(g_targetIp);
-  Serial.print(":");
-  Serial.println(UDP_TARGET_PORT);
-  return ok;
+
+  if (g_run_wifi && WiFi.status() == WL_CONNECTED) {
+    udpPrintList();
+    if (udpSendCommandWaitAck(cmd, 120)) {
+      return true;
+    }
+    Serial.println("[PATH] UDP 無回覆，改用 BLE（若已開啟/已連線）");
+  }
+
+#if ENABLE_BLE_CLIENT
+  if (g_run_ble && g_bleConnected && g_bleRxChar) {
+    bleMirrorCommand(cmd);
+    return true;
+  }
+#endif
+
+  if (g_run_wifi && WiFi.status() == WL_CONNECTED) {
+    return udpSendCommand(cmd);
+  }
+  Serial.println("[PATH] WiFi 未連線且 BLE 未連線，未送出");
+  return false;
+}
+
+static void pollIncomingUdpMessages() {
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return;
+  for (int i = 0; i < 4; i++) {
+    int p = g_udp.parsePacket();
+    if (p <= 0) return;
+    IPAddress rip = g_udp.remoteIP();
+    uint16_t rport = (uint16_t)g_udp.remotePort();
+    char buf[256];
+    int n = g_udp.read(buf, (int)sizeof(buf) - 1);
+    if (n <= 0) continue;
+    buf[n] = '\0';
+    Serial.print("[UDP IN] ");
+    Serial.print(rip);
+    Serial.print(":");
+    Serial.print(rport);
+    Serial.print("  ");
+    Serial.println(buf);
+  }
+}
+
+static String extractC3CmdFromReply(const String& reply) {
+  // Look for a line like: C3_CMD: <command>
+  // Prefer the *last* occurrence so a corrected final line wins over earlier mistakes.
+  int k = reply.lastIndexOf("C3_CMD:");
+  if (k < 0) k = reply.lastIndexOf("c3_cmd:");
+  if (k < 0) k = reply.lastIndexOf("C3:");
+  if (k < 0) k = reply.lastIndexOf("c3:");
+  if (k < 0) return "";
+  int end = reply.indexOf('\n', k);
+  String line = (end < 0) ? reply.substring(k) : reply.substring(k, end);
+  int colon = line.indexOf(':');
+  if (colon < 0) return "";
+  String cmd = line.substring(colon + 1);
+  cmd.trim();
+  if (cmd.length() > 200) cmd = cmd.substring(0, 200);
+  return cmd;
+}
+
+// Map generic AI tokens to the current C3 sketch (fan PWM + UDP).
+static String normalizeC3UdpCommand(const String& cmd) {
+  String t = cmd;
+  t.trim();
+  if (!t.length()) return t;
+  String low = t;
+  low.toLowerCase();
+  if (low == "on" || low == "led_on") return "fan on";
+  if (low == "off" || low == "led_off") return "fan off";
+  return t;
+}
+
+static bool sendRawToC3(const String& cmd) {
+  String t = normalizeC3UdpCommand(cmd);
+  if (!t.length()) return false;
+  Serial.print("[C3 CMD] ");
+  Serial.println(t);
+  return udpSendCommand(t.c_str());
+}
+
+// Drop stale UDP packets from C3 before sending a new command (same socket as udpSendCommand).
+static void drainUdpFromC3() {
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return;
+  while (g_udp.parsePacket() > 0) {
+    char tmp[256];
+    while (g_udp.available() > 0) {
+      (void)g_udp.read(tmp, (int)sizeof(tmp));
+    }
+  }
+}
+
+// Wait for one UDP reply from the current C3 target (after sendRawToC3).
+static String waitUdpReplyFromC3(unsigned long timeoutMs) {
+  String acc;
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED || !g_targetIp) return acc;
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    int p = g_udp.parsePacket();
+    if (p > 0) {
+      IPAddress rip = g_udp.remoteIP();
+      if (rip != g_targetIp) {
+        Serial.print("[C3 RX drop] from ");
+        Serial.print(rip);
+        Serial.print(" (expect ");
+        Serial.print(g_targetIp);
+        Serial.println(")");
+        char tmp[256];
+        while (g_udp.available() > 0) (void)g_udp.read(tmp, (int)sizeof(tmp));
+        continue;
+      }
+      char buf[2048];
+      int n = g_udp.read(buf, (int)sizeof(buf) - 1);
+      if (n > 0) {
+        buf[n] = '\0';
+        acc += buf;
+        while (g_udp.available() > 0) {
+          n = g_udp.read(buf, (int)sizeof(buf) - 1);
+          if (n > 0) {
+            buf[n] = '\0';
+            acc += buf;
+          }
+        }
+        break;
+      }
+    }
+    delay(2);
+    yield();
+  }
+  acc.trim();
+  return acc;
 }
 
 static String escapeJsonString(const String& s) {
@@ -693,6 +1000,8 @@ static String udpTargetsJsonArray() {
 }
 
 static void httpPostLogBestEffort(const String& inputText, const String& outputText, const char* kind) {
+  if (!g_run_wifi) return;
+  if (WiFi.status() != WL_CONNECTED) return;
   if (!inputText.length() || !outputText.length()) return;
   WiFiClientSecure client;
   client.setInsecure();
@@ -720,6 +1029,8 @@ static bool httpPostChat(const String& text, String& outReply, String& outDevice
   outDeviceTarget = "";
   outDeviceLink = "";
   outTtsUrl = "";
+  if (!g_run_wifi) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -792,7 +1103,6 @@ static void writeWavHeader(uint8_t* dst, uint32_t dataBytes) {
 }
 
 static bool i2sBeginForMic() {
-  // INMP441 多為 32-bit slot；與 esp32_voice_ai_robot::i2sBeginForRecord 相同
   I2S.end();
   I2S.setPins(PIN_BCLK, PIN_WS, PIN_DOUT, PIN_DIN);
   return I2S.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
@@ -810,7 +1120,6 @@ static void recFreeAbort() {
   g_recMaxMs = 0;
 }
 
-/** 優先 PSRAM，其次內部連續塊，最後 malloc（降低錄音緩衝 malloc 失敗機率） */
 static uint8_t* allocRecordingBuffer(size_t cap) {
   uint8_t* p = nullptr;
   if (ESP.getPsramSize() > 0) {
@@ -842,6 +1151,14 @@ static void printMallocHint(size_t needBytes) {
 }
 
 static bool recTryStart() {
+  if (!g_run_mic) {
+    Serial.println("[REC] 麥克風未啟用（開機選 3）");
+    return false;
+  }
+  if (!g_run_wifi) {
+    Serial.println("[REC] 需要 WiFi 才能上傳 STT（開機選 1）");
+    return false;
+  }
   if (g_recording) {
     Serial.println("[REC] 已在錄音中");
     return false;
@@ -926,7 +1243,6 @@ static void recPump() {
   g_pcmDataBytes += outN * sizeof(int16_t);
 }
 
-/** 錄音中呼叫：非阻塞讀 Serial，若收到單獨一行 r 則回傳 true */
 static bool pollSerialRecordingStop() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -948,6 +1264,8 @@ static bool pollSerialRecordingStop() {
 
 static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
   outText = "";
+  if (!g_run_wifi) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   client.setInsecure();
   client.setHandshakeTimeout(30);
@@ -1028,6 +1346,7 @@ static String stripForTts(const String& s) {
 
 static bool httpPostTts(const String& text, String& outAbsoluteUrl) {
   outAbsoluteUrl = "";
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   client.setInsecure();
   client.setHandshakeTimeout(30);
@@ -1056,6 +1375,7 @@ static bool httpPostTts(const String& text, String& outAbsoluteUrl) {
 
 static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
   outSize = 0;
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return nullptr;
   WiFiClientSecure client;
   client.setInsecure();
   client.setHandshakeTimeout(30);
@@ -1165,8 +1485,8 @@ static void speakAiReply(const String& replyText, const String& inlineTtsUrl) {
   free(mp3);
   i2sBeginForMic();
 }
-#endif  // ENABLE_TTS
-#endif  // ENABLE_I2S_MIC
+#endif
+#endif
 
 void setup() {
   Serial.begin(115200);
@@ -1174,75 +1494,127 @@ void setup() {
 
   Serial.println();
   Serial.println("=== ESP32-S3 AI + UDP -> ESP32-C3 LED ===");
-  Serial.println("Mode: 僅依 /api/chat 的 device_cmd / device_target 送 UDP（無本地語意判燈）");
-
-#if ENABLE_WIFI_AP
-  WiFi.mode(WIFI_AP_STA);
-#else
-  WiFi.mode(WIFI_STA);
-#endif
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi(STA)");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("WiFi STA IP: ");
-  Serial.println(WiFi.localIP());
-
-#if ENABLE_WIFI_AP
-  if (WiFi.softAP(AP_SSID, AP_PASS)) {
-    Serial.print("SoftAP SSID: ");
-    Serial.print(AP_SSID);
-    Serial.print("  IP: ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    Serial.println("[WiFi] SoftAP 啟動失敗（檢查 AP_PASS 長度>=8）");
-  }
-#endif
+  Serial.println("[BOOT] WiFi auto-connect enabled (will retry)");
 
   udpTargetsLoad();
-  g_udp.begin(0);
-  if (!g_targetIp) {
-    Serial.println("[UDP] 無有效 C3 目標 — 請在 wifi_secrets.h 設 UDP_TARGET_IP，或 Serial: udp add …");
-  } else {
-    Serial.print("[UDP] 目前指令目標 ");
-    Serial.print(g_targetIp);
-    Serial.print(":");
-    Serial.println(UDP_TARGET_PORT);
-  }
-  udpPrintList();
-  Serial.println("多個 C3：udp help（僅設定目標；開關燈由雲端 AI 判斷）");
+  syncTargetIpFromIndex();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   Serial.println();
-  Serial.println("輸入一行文字；輸入 r 開始錄音，再輸入 r 停止並上傳語音：");
+  Serial.println("輸入一行文字送 AI；雲端依 device_cmd 送 UDP；若 UDP 無回覆則改用 BLE（需可用 BLE）");
+  Serial.print("PC 亦可經 WiFi UDP 送同一行文字：埠 ");
+  Serial.println((unsigned)S3_PC_CMD_UDP_PORT);
 #if ENABLE_I2S_MIC
-  Serial.println("麥克風調校（同 esp32_voice_ai_robot）: micL / micR 聲道, shift8..shift20 增益");
+  Serial.println("輸入 r 開始錄音，再輸入 r 停止並上傳 STT（需要 WiFi）");
 #if ENABLE_TTS
-  Serial.println("TTS 喇叭: ON（POST /api/tts -> MAX98357A）");
-#else
-  Serial.println("TTS 喇叭: OFF（ENABLE_TTS=0）");
+  Serial.println("TTS：AI 回覆後會播 MP3（需要 WiFi）");
 #endif
+  Serial.println("micL/micR、shift8..shift20");
 #endif
-#if ENABLE_WIFI_AP
-  Serial.println("WiFi 熱點(SoftAP)已開，手機可連 SSID 見上");
+
+#if ENABLE_BLE_CLIENT
+  bleClientInit();
 #endif
 }
 
+static void wifiPcReplyIf(uint16_t pcRport, const IPAddress& pcRip, const String& msg) {
+  if (pcRport == 0 || WiFi.status() != WL_CONNECTED) return;
+  g_udpPcCmd.beginPacket(pcRip, pcRport);
+  g_udpPcCmd.print(msg);
+  (void)g_udpPcCmd.endPacket();
+}
+
 static void processUserTextLine(const String& line) {
+  IPAddress pcRip = g_wifiPcReplyIp;
+  uint16_t pcRport = g_wifiPcReplyPort;
+  g_wifiPcReplyPort = 0;
+
+  if (WiFi.status() != WL_CONNECTED && g_run_ble) {
+    String u = line;
+    u.trim();
+    String up = u;
+    up.toUpperCase();
+    if (up.length() == 0) {
+      Serial.println("請繼續輸入（ON/OFF/B0..B100）：");
+      return;
+    }
+#if ENABLE_BLE_CLIENT
+    if (up == "ON") {
+      bleMirrorCommand("ON");
+      Serial.println("[DONE] BLE");
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    if (up == "OFF") {
+      bleMirrorCommand("OFF");
+      Serial.println("[DONE] BLE");
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    if (up == "B0" || up == "B25" || up == "B50" || up == "B75" || up == "B100") {
+      bleMirrorCommand(up.c_str());
+      Serial.println("[DONE] BLE");
+      Serial.println("請繼續輸入：");
+      return;
+    }
+#endif
+    Serial.println("[BLE] 未知指令；請輸入 ON / OFF / B0 / B25 / B50 / B75 / B100");
+    Serial.println("請繼續輸入：");
+    wifiPcReplyIf(pcRport, pcRip, "[S3] ERR: use Serial/BLE for ON/OFF here (WiFi chat needs STA).\n");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] 尚未連線，可先用 BLE 送 ON/OFF/Bxx（若 BLE 可用）");
+    Serial.println("請繼續輸入：");
+    wifiPcReplyIf(pcRport, pcRip, "[S3] ERR: WiFi not connected\n");
+    return;
+  }
   String reply;
   String deviceCmd;
   String deviceTarget;
   String deviceLink;
   String ttsUrl;
   Serial.println("[CHAT] ...");
-  if (!httpPostChat(line, reply, deviceCmd, deviceTarget, deviceLink, ttsUrl)) {
+  // Ask the cloud model to also emit a C3 command when appropriate.
+  // This doesn't require backend schema changes; we parse from reply text.
+  String prompt = line;
+  prompt += "\n\n請在最後一行（如果需要控制 C3 或 OTA）輸出：C3_CMD: <cmd>\n"
+            "C3 為 LED：led_on / led_off / led 0..255（不要用單獨的 on 或 off）。\n"
+            "查目前韌體/腳位/狀態：用 C3_CMD: status 或 buildid（S3 會把 C3 的 UDP 回覆再送交雲端整理成最終回答）。\n"
+            "【重要】若 C3_CMD 不是 (none)：第一輪正文可簡短；最終給使用者的完整說明會由裝置在收到 C3 實際 UDP 回覆後再經第二輪雲端整理後輸出。\n"
+            "純問答、不需查裝置：正文直接完整回答，並輸出 C3_CMD: (none)；"
+            "不要對「查線路/問腳位」使用 ai，因為 ai 只會觸發遠端 PC 改碼+OTA，不會把結果文字送回這裡。\n"
+            "僅當使用者要改 C3 韌體時才用：C3_CMD: ai <給 PC 的改碼需求>；"
+            "OTA：ota http://<pc>:8000/<file>.bin\n"
+            "不需送 C3：C3_CMD: (none)";
+  if (!httpPostChat(prompt, reply, deviceCmd, deviceTarget, deviceLink, ttsUrl)) {
     Serial.println("請繼續輸入：");
+    wifiPcReplyIf(pcRport, pcRip, "[S3] ERR: cloud chat request failed\n");
     return;
   }
-  Serial.print("[AI] ");
-  Serial.println(reply);
+
+  String c3cmd = extractC3CmdFromReply(reply);
+  bool hasC3Cmd =
+      c3cmd.length() > 0 && !c3cmd.equalsIgnoreCase("(none)") && !c3cmd.equalsIgnoreCase("none");
+  String c3low = c3cmd;
+  c3low.toLowerCase();
+  // ai / ota：不等待 C3 UDP 文字回饋第二輪（改由 PC bridge 或長時間 OTA），維持第一輪即回覆。
+  bool c3IsAiOrOta = c3low.startsWith("ai ") || c3low.startsWith("ota ");
+  bool deferFinalAi = hasC3Cmd && g_targetIp && !c3IsAiOrOta;
+
+  String outReply = reply;
+  String outTtsUrl = ttsUrl;
+  bool gotSecondPass = false;
+
+  if (!deferFinalAi) {
+    Serial.print("[AI] ");
+    Serial.println(reply);
+  } else {
+    Serial.println("[CHAT] 偵測到需送 C3 的指令：先等 C3 UDP 回饋，再輸出最終整理回答（不先播報第一輪正文）。");
+  }
+
   deviceCmd.toLowerCase();
   deviceCmd.trim();
   deviceTarget.trim();
@@ -1266,11 +1638,11 @@ static void processUserTextLine(const String& line) {
 
   if (targetOk && deviceCmd == "on") {
     Serial.println("[PATH] AI device_cmd -> UDP ON");
-    udpSendCommand("ON");
+    deviceSendCommandAuto("ON");
     httpPostLogBestEffort(line, "ON", "ai_device_cmd");
   } else if (targetOk && deviceCmd == "off") {
     Serial.println("[PATH] AI device_cmd -> UDP OFF");
-    udpSendCommand("OFF");
+    deviceSendCommandAuto("OFF");
     httpPostLogBestEffort(line, "OFF", "ai_device_cmd");
   } else if (targetOk && (deviceCmd == "b0" || deviceCmd == "b25" || deviceCmd == "b50" || deviceCmd == "b75" ||
                           deviceCmd == "b100")) {
@@ -1278,18 +1650,174 @@ static void processUserTextLine(const String& line) {
     u.toUpperCase();
     Serial.print("[PATH] AI device_cmd -> UDP ");
     Serial.println(u);
-    udpSendCommand(u.c_str());
+    deviceSendCommandAuto(u.c_str());
     httpPostLogBestEffort(line, u, "ai_device_cmd");
   }
 
+  // Send C3_CMD from first reply (already parsed into c3cmd / hasC3Cmd).
+  if (hasC3Cmd) {
+    if (!g_targetIp) {
+      Serial.println("[C3] 無有效目標 IP。請先用 udp add/use 設定 C3 的 IP。");
+    } else {
+      if (c3low.startsWith("ai ")) {
+        Serial.println(
+            "[NOTE] ai 會轉發到 PC；Bridge 結束後會以 UDP 回傳 BRIDGE_RESULT（請開著 udp_bridge）。"
+            "若只問接線請用 status 或看上文。");
+      }
+      drainUdpFromC3();
+      bool sentOk = sendRawToC3(c3cmd);
+      if (!sentOk && deferFinalAi) {
+        Serial.println("[CHAT] 無法送出 UDP，改輸出第一輪回答。");
+        Serial.print("[AI] ");
+        Serial.println(reply);
+        deferFinalAi = false;
+      }
+      if (sentOk) {
+        // ai/ota: no second cloud summary here (PC bridge or long OTA).
+        if (!c3low.startsWith("ai ") && !c3low.startsWith("ota ")) {
+          String c3rx = waitUdpReplyFromC3(4000);
+          if (c3rx.length() == 0) {
+            delay(80);
+            c3rx = waitUdpReplyFromC3(600);
+          }
+          if (c3rx.length() == 0) {
+            Serial.println(
+                "[C3 RX] (timeout / no UDP payload) — check C3 replies to S3 source port, "
+                "router AP isolation, and that S3 uses fixed C3 UDP local port.");
+            if (deferFinalAi) {
+              Serial.println("[CHAT] 未取得 C3 回饋，改輸出第一輪回答。");
+              Serial.print("[AI] ");
+              Serial.println(reply);
+              deferFinalAi = false;
+            }
+          }
+          if (c3rx.length() > 0) {
+            Serial.print("[C3 RX] ");
+            Serial.println(c3rx);
+            String c3rxCopy = c3rx;
+            if (c3rxCopy.length() > 3500) {
+              c3rxCopy = c3rxCopy.substring(0, 3500);
+              c3rxCopy += "...";
+            }
+            String replyDraft = reply;
+            if (replyDraft.length() > 1500) {
+              replyDraft = replyDraft.substring(0, 1500);
+              replyDraft += "...";
+            }
+            String fp = "使用者問：\n";
+            fp += line;
+            fp += "\n\n雲端第一輪回覆草稿（請與下方 C3 實測對照後一併整理，勿與裝置實際狀態矛盾）：\n";
+            fp += replyDraft;
+            fp += "\n\nC3 裝置經 UDP 回覆如下（請據此與上文整理成給使用者的最終說明）：\n";
+            fp += c3rxCopy;
+            fp += "\n\n請用繁體中文整理最終回答（可說明已依 C3 實際回覆確認）。最後一行請輸出 C3_CMD: (none)。";
+            String reply2;
+            String dc2;
+            String dt2;
+            String dl2;
+            String tu2;
+            if (httpPostChat(fp, reply2, dc2, dt2, dl2, tu2)) {
+              gotSecondPass = true;
+              Serial.print("[AI] ");
+              Serial.println(reply2);
+              outReply = reply2;
+              outTtsUrl = tu2;
+              httpPostLogBestEffort(line, reply2 + " |c3_udp_followup", "chat");
+            } else {
+              Serial.println("[AI] ERR: second pass (C3 follow-up) httpPostChat failed");
+              if (deferFinalAi) {
+                outReply = reply;
+                outReply += "\n\n[NOTE] 第二輪整理失敗；上為第一輪草稿。";
+                outTtsUrl = ttsUrl;
+                Serial.print("[AI] ");
+                Serial.println(reply);
+                deferFinalAi = false;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (deferFinalAi && !gotSecondPass) {
+    // 仍有延遲旗標但第二輪未成功（理論上上面已回退；此為保險）。
+    Serial.print("[AI] ");
+    Serial.println(reply);
+    outReply = reply;
+    outTtsUrl = ttsUrl;
+  }
+
 #if ENABLE_I2S_MIC && ENABLE_TTS
-  speakAiReply(reply, ttsUrl);
+  if (g_run_wifi) {
+    speakAiReply(outReply, outTtsUrl);
+  }
 #endif
+
+  if (pcRport != 0) {
+    String summary = outReply;
+    if (summary.length() > 1200) {
+      summary = summary.substring(0, 1200);
+      summary += "\n...";
+    }
+    wifiPcReplyIf(pcRport, pcRip, summary);
+  }
 
   Serial.println("[DONE]\n請繼續輸入：");
 }
 
+static void pollWifiPcCommand() {
+  if (!g_run_wifi || WiFi.status() != WL_CONNECTED || !g_udpPcCmdStarted) return;
+  int n = g_udpPcCmd.parsePacket();
+  if (n <= 0) return;
+  IPAddress rip = g_udpPcCmd.remoteIP();
+  uint16_t rport = (uint16_t)g_udpPcCmd.remotePort();
+  int r = g_udpPcCmd.read(g_pcUdpBuf, (int)sizeof(g_pcUdpBuf) - 1);
+  if (r <= 0) return;
+  g_pcUdpBuf[r] = '\0';
+  // If the packet was larger than our buffer, discard the remaining bytes
+  // to avoid confusing the next parsePacket().
+  while (g_udpPcCmd.available() > 0) {
+    (void)g_udpPcCmd.read();
+  }
+  String raw(g_pcUdpBuf);
+  // PC udp_bridge.py sends BRIDGE_RESULT + summary (do not feed into cloud chat).
+  if (raw.startsWith("BRIDGE_RESULT")) {
+    Serial.println("\n[PC_BRIDGE] ----------");
+    String rest = raw.substring(13);
+    if (rest.startsWith("\n")) rest = rest.substring(1);
+    if (rest.startsWith("\r\n")) rest = rest.substring(2);
+    Serial.println(rest);
+    Serial.println("[PC_BRIDGE] ----------\n");
+    return;
+  }
+  String line = raw;
+  line.trim();
+  if (!line.length()) return;
+  if (line.length() > 2000) {
+    wifiPcReplyIf(rport, rip, "[S3] ERR: line too long (max 2000)\n");
+    return;
+  }
+  g_wifiPcReplyIp = rip;
+  g_wifiPcReplyPort = rport;
+  Serial.print("[WIFI] ");
+  Serial.println(line);
+  processUserTextLine(line);
+}
+
 void loop() {
+#if ENABLE_BLE_CLIENT
+  if (g_run_ble) {
+    bleClientTick();
+  }
+#endif
+#if defined(ARDUINO_ARCH_ESP32)
+  wifiTick();
+#endif
+
+  // Always show any UDP replies (e.g., buildid) when idle.
+  pollIncomingUdpMessages();
+  pollWifiPcCommand();
 #if ENABLE_I2S_MIC
   if (g_recording) {
     recPump();
@@ -1329,7 +1857,7 @@ void loop() {
   if (tryHandleUdpTargetLine(line)) return;
 
 #if ENABLE_I2S_MIC
-  if (line.startsWith("shift")) {
+  if (g_run_mic && WiFi.status() == WL_CONNECTED && line.startsWith("shift")) {
     int v = line.substring(5).toInt();
     if (v >= 8 && v <= 20) {
       g_recShift = v;
@@ -1340,12 +1868,12 @@ void loop() {
     }
     return;
   }
-  if (line == "micL" || line == "micl") {
+  if (g_run_mic && WiFi.status() == WL_CONNECTED && (line == "micL" || line == "micl")) {
     g_micUseRight = false;
     Serial.println("[CFG] mic channel = LEFT");
     return;
   }
-  if (line == "micR" || line == "micr") {
+  if (g_run_mic && WiFi.status() == WL_CONNECTED && (line == "micR" || line == "micr")) {
     g_micUseRight = true;
     Serial.println("[CFG] mic channel = RIGHT");
     return;
@@ -1353,7 +1881,7 @@ void loop() {
 #endif
 
 #if ENABLE_I2S_MIC
-  {
+  if (g_run_mic && WiFi.status() == WL_CONNECTED) {
     String key = line;
     key.toLowerCase();
     if (key == "r") {
