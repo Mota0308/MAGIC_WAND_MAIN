@@ -846,6 +846,16 @@ def _strip_poe_stt_status_noise(text: str) -> str:
     return t2.strip()
 
 
+def _poe_take_from_first_cjk_or_kana(text: str) -> str:
+    """If the bot prepends English status then real transcript, keep from first CJK/kana."""
+    if not text:
+        return ""
+    m = re.search(r"[\u3040-\u30ff\u4e00-\u9fff\u3400-\u4dbf]", text)
+    if not m:
+        return ""
+    return text[m.start() :].strip()
+
+
 def _poe_stt_wav(wav_bytes: bytes) -> str:
     """
     Call Poe bot (e.g. Whisper-V3-Large-T) via fastapi-poe with file upload.
@@ -887,16 +897,32 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
             t = getattr(partial, "text", None)
             if isinstance(t, str):
                 parts.append(t)
-    raw = "".join(parts).strip()
-    # If the bot streams cumulative full snapshots, the last string is usually the final text (avoid duplicate joins).
     str_parts = [p for p in parts if isinstance(p, str)]
-    if len(str_parts) >= 2 and str_parts[-1].startswith(str_parts[0][: min(32, len(str_parts[0]))]):
-        raw = str_parts[-1].strip()
+    if not str_parts:
+        raise ValueError("Poe STT returned no text chunks from get_bot_response_sync")
+    # Prefer longest chunk: many Poe bots stream cumulative text; the longest string is usually the full message.
+    raw = max(str_parts, key=len).strip()
+    joined = "".join(str_parts).strip()
+    if len(joined) > len(raw) * 1.2:
+        raw = joined
     text = _strip_poe_stt_status_noise(raw)
     if not text:
+        text = _poe_take_from_first_cjk_or_kana(raw)
+    if not text:
+        text = _poe_take_from_first_cjk_or_kana(joined)
+    # Soft fallback: older deployments passed status strings through as "text" so STT never 502'd.
+    # If Poe truly returns only English status, chat may still be useless — fix POE_STT_MODEL in Railway.
+    if not text:
+        fallback = raw or joined
+        if fallback.strip():
+            print(
+                "[STT] Poe STT: no transcript after cleanup; using raw bot output (len=%d). "
+                "Consider POE_STT_MODEL=Whisper-V3-Large-T or STT_PROVIDER=openai."
+                % len(fallback)
+            )
+            return fallback.strip()
         raise ValueError(
-            "Poe STT returned only status text (no transcript). "
-            "Try another POE_STT_MODEL (Whisper bot) or set STT_PROVIDER=openai with OPENAI_API_KEY."
+            "Poe STT returned empty response. Check POE_API_KEY, POE_STT_MODEL, and fastapi-poe."
         )
     return text
 
