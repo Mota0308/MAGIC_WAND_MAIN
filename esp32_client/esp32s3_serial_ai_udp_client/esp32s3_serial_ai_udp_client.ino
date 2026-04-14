@@ -33,7 +33,12 @@
 #define ENABLE_TTS 0
 #endif
 #ifndef MIC_MAX_RECORD_SECONDS
-#define MIC_MAX_RECORD_SECONDS 5
+// 愈短上傳愈快、雲端 STT 愈快（辨識品質略降）；可改 2
+#define MIC_MAX_RECORD_SECONDS 10
+#endif
+// 等 STT HTTP 回應：雲端用 OpenAI 時通常 <1 分鐘；若仍用 Poe 請改大（例如 360）
+#ifndef STT_HTTP_READ_TIMEOUT_SEC
+#define STT_HTTP_READ_TIMEOUT_SEC 120
 #endif
 
 #if ENABLE_I2S_MIC
@@ -1270,9 +1275,13 @@ static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
   client.setInsecure();
   client.setHandshakeTimeout(30);
   HTTPClient http;
+  // 必須 >= http.setTimeout：否則等待 STT 回應時會先被底層 TCP read 截斷（HTTP -11）
+  client.setTimeout(STT_HTTP_READ_TIMEOUT_SEC);
   if (!http.begin(client, STT_URL)) return false;
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.addHeader("Content-Type", "audio/wav");
-  http.setTimeout(180000);
+  http.setTimeout((uint32_t)STT_HTTP_READ_TIMEOUT_SEC * 1000u);
   int code = http.POST((uint8_t*)wav, wavLen);
   String resp = http.getString();
   http.end();
@@ -1280,6 +1289,16 @@ static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
     Serial.print("[STT HTTP ");
     Serial.print(code);
     Serial.println("]");
+    if (code < 0) {
+      Serial.print("[STT ERR] ");
+      Serial.println(http.errorToString(code));
+      Serial.print("[STT URL] ");
+      Serial.println(STT_URL);
+      Serial.print("[WiFi] RSSI=");
+      Serial.println(WiFi.RSSI());
+      Serial.print("[SYS] freeHeap=");
+      Serial.println(ESP.getFreeHeap());
+    }
     Serial.println(resp);
     return false;
   }

@@ -7,6 +7,7 @@ Railway + MongoDB 後端範例
 
 import json as json_lib
 import os
+import re
 import urllib.error
 import urllib.request
 import time
@@ -733,13 +734,33 @@ def _encode_multipart_form(fields, files):
     return boundary, bytes(body)
 
 
+def _openai_transcription_model() -> str:
+    """
+    POST /v1/audio/transcriptions only accepts transcription models.
+    If OPENAI_STT_MODEL is mistakenly set to a chat/completions model, OpenAI returns
+    HTTP 400 with 'Audio files are not supported for transcription'.
+    """
+    raw = (os.environ.get("OPENAI_STT_MODEL") or "whisper-1").strip() or "whisper-1"
+    # Keep in sync with https://platform.openai.com/docs/api-reference/audio/createTranscription
+    allowed = {
+        "whisper-1",
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe-diarize",
+    }
+    if raw in allowed:
+        return raw
+    print(f"[STT] OPENAI_STT_MODEL={raw!r} is not valid for /audio/transcriptions; using whisper-1")
+    return "whisper-1"
+
+
 def _openai_stt_wav(wav_bytes: bytes) -> str:
     """Call OpenAI audio transcriptions API with a WAV file; return text."""
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise ValueError("OPENAI_API_KEY not set")
 
-    model = os.environ.get("OPENAI_STT_MODEL", "whisper-1").strip() or "whisper-1"
+    model = _openai_transcription_model()
     language = os.environ.get("OPENAI_STT_LANGUAGE", "").strip()  # optional: "zh"
 
     fields = [("model", model)]
@@ -760,12 +781,70 @@ def _openai_stt_wav(wav_bytes: bytes) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        data = json_lib.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json_lib.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw_body = e.read().decode("utf-8", errors="replace")
+        msg = raw_body
+        try:
+            err = json_lib.loads(raw_body)
+            inner = err.get("error")
+            if isinstance(inner, dict):
+                msg = inner.get("message") or inner.get("code") or str(inner)
+            elif isinstance(inner, str):
+                msg = inner
+        except Exception:
+            pass
+        raise RuntimeError(f"OpenAI STT HTTP {e.code}: {msg}") from e
     text = (data.get("text") or "").strip()
     if not text:
         raise ValueError("STT returned empty text")
     return text
+
+def _strip_poe_stt_status_noise(text: str) -> str:
+    """
+    Poe bots sometimes stream status lines (e.g. Cartesia) that are not the transcript.
+    Remove common English status fragments so downstream chat gets real speech text only.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+    # Non-greedy removals of frequent status blobs (with or without newlines)
+    patterns = [
+        r"(?is)Downloading\s+audio\s+file\.{0,3}",
+        r"(?is)Transcribing\s+audio\s+with\s+Cartesia\.{0,3}",
+        r"(?is)Transcribing\s+audio\.{0,3}",
+        r"(?is)Please\s+wait\.{0,3}",
+    ]
+    for pat in patterns:
+        t = re.sub(pat, "", t)
+    # Drop whole lines that look like tooling status
+    kept = []
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if any(
+            x in low
+            for x in (
+                "downloading",
+                "transcribing audio",
+                "cartesia",
+                "please wait",
+                "processing your audio",
+            )
+        ):
+            continue
+        kept.append(s)
+    out = "\n".join(kept).strip()
+    if out:
+        return out
+    # Fallback: if only noise was removed, try taking the tail after last ellipsis blob
+    t2 = re.sub(r"(?is)(Downloading|Transcribing)[^.]*(\.{3}|…)?", "", text)
+    return t2.strip()
+
 
 def _poe_stt_wav(wav_bytes: bytes) -> str:
     """
@@ -794,7 +873,8 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
         content=(
             "請把這段音訊『逐字轉寫成繁體中文』，"
             "不要翻譯成其他語言，也不要總結或改寫，只輸出聽到的內容本身，"
-            "不加任何說明或標註。"
+            "不要輸出任何『Downloading / Transcribing / Cartesia』等狀態說明，"
+            "不要加任何說明或標註。"
         ),
         attachments=[att],
     )
@@ -804,13 +884,20 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
         if isinstance(partial, str):
             parts.append(partial)
         else:
-            # Best-effort: some versions may yield objects with .text
             t = getattr(partial, "text", None)
             if isinstance(t, str):
                 parts.append(t)
-    text = "".join(parts).strip()
+    raw = "".join(parts).strip()
+    # If the bot streams cumulative full snapshots, the last string is usually the final text (avoid duplicate joins).
+    str_parts = [p for p in parts if isinstance(p, str)]
+    if len(str_parts) >= 2 and str_parts[-1].startswith(str_parts[0][: min(32, len(str_parts[0]))]):
+        raw = str_parts[-1].strip()
+    text = _strip_poe_stt_status_noise(raw)
     if not text:
-        raise ValueError("Poe STT returned empty text")
+        raise ValueError(
+            "Poe STT returned only status text (no transcript). "
+            "Try another POE_STT_MODEL (Whisper bot) or set STT_PROVIDER=openai with OPENAI_API_KEY."
+        )
     return text
 
 
@@ -996,6 +1083,10 @@ def stt():
     Accepts:
     - Raw WAV bytes with Content-Type: audio/wav (recommended for ESP32)
     - JSON: { "wav_base64": "...", "device_id": "optional" }
+
+    Env:
+    - STT_PROVIDER: auto (default) | openai | poe
+      auto prefers OPENAI_API_KEY (Whisper) when set — faster than Poe for most setups.
     """
     wav_bytes = b""
     ct = (request.headers.get("Content-Type") or "").lower()
@@ -1017,13 +1108,33 @@ def stt():
         timeout_sec = float(os.environ.get("STT_TIMEOUT_SEC", "45") or "45")
         if timeout_sec < 5:
             timeout_sec = 5.0
-        # Prefer Poe STT if configured; else fall back to OpenAI STT.
-        if os.environ.get("POE_API_KEY", "").strip():
+        # STT_PROVIDER: openai | poe | auto (default auto).
+        # auto: prefer OpenAI Whisper when OPENAI_API_KEY is set — usually much faster than Poe.
+        # Use STT_PROVIDER=poe only if you explicitly want Poe despite having OpenAI.
+        prov = (os.environ.get("STT_PROVIDER") or "auto").strip().lower()
+        if prov not in ("auto", "openai", "poe"):
+            prov = "auto"
+        oa_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        poe_key = os.environ.get("POE_API_KEY", "").strip()
+        if prov == "poe":
+            if not poe_key:
+                return jsonify({"ok": False, "error": "POE_API_KEY required when STT_PROVIDER=poe"}), 400
             text = _run_with_timeout(lambda: _poe_stt_wav(wav_bytes), timeout_sec=timeout_sec)
             mode = "poe"
-        else:
+        elif prov == "openai":
+            if not oa_key:
+                return jsonify({"ok": False, "error": "OPENAI_API_KEY required when STT_PROVIDER=openai"}), 400
             text = _run_with_timeout(lambda: _openai_stt_wav(wav_bytes), timeout_sec=timeout_sec)
             mode = "openai"
+        else:
+            if oa_key:
+                text = _run_with_timeout(lambda: _openai_stt_wav(wav_bytes), timeout_sec=timeout_sec)
+                mode = "openai"
+            elif poe_key:
+                text = _run_with_timeout(lambda: _poe_stt_wav(wav_bytes), timeout_sec=timeout_sec)
+                mode = "poe"
+            else:
+                raise ValueError("No STT API key configured")
     except concurrent.futures.TimeoutError:
         return jsonify({"ok": False, "error": "STT timeout"}), 504
     except Exception as e:
