@@ -1219,6 +1219,8 @@ def stt():
     Env:
     - STT_PROVIDER: auto (default) | openai | poe
       auto prefers OPENAI_API_KEY (Whisper) when set — faster than Poe for most setups.
+    - STT_TIMEOUT_SEC: wall-clock limit for one STT call (default 180s; Poe often needs 60–120s+).
+      Capped at 600 to avoid hanging workers.
     """
     wav_bytes = b""
     ct = (request.headers.get("Content-Type") or "").lower()
@@ -1237,9 +1239,12 @@ def stt():
         return jsonify({"ok": False, "error": "Missing WAV audio"}), 400
 
     try:
-        timeout_sec = float(os.environ.get("STT_TIMEOUT_SEC", "45") or "45")
+        # Poe STT regularly exceeds 45s; default 180s. Set STT_PROVIDER=openai for faster Whisper.
+        timeout_sec = float(os.environ.get("STT_TIMEOUT_SEC", "180") or "180")
         if timeout_sec < 5:
             timeout_sec = 5.0
+        if timeout_sec > 600:
+            timeout_sec = 600.0
         # STT_PROVIDER: openai | poe | auto (default auto).
         # auto: prefer OpenAI Whisper when OPENAI_API_KEY is set — usually much faster than Poe.
         # Use STT_PROVIDER=poe only if you explicitly want Poe despite having OpenAI.
