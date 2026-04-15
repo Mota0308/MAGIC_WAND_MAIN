@@ -46,6 +46,7 @@
 #define CHAT_URL  "https://magicwandmain-production.up.railway.app/api/chat"
 #define TTS_URL   "https://magicwandmain-production.up.railway.app/api/tts"
 #define COMMAND_URL "https://magicwandmain-production.up.railway.app/api/command"
+
 #define LOG_URL  "https://magicwandmain-production.up.railway.app/api/log"
 #define DEVICE_ID "esp32_voice_001"
 // ---------- UDP target (ESP8266) ----------

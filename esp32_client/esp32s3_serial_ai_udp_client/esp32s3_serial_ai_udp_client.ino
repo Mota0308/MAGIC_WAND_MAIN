@@ -25,8 +25,8 @@
 #define ENABLE_I2S_MIC 1
 #endif
 #ifndef ENABLE_TTS
-// Disable by default to reduce flash usage.
-#define ENABLE_TTS 0
+// 1 = AI 回覆後下載 MP3 並用 I2S 播放（需 MAX98357A 等）；0 可省 flash，但喇叭不會播 TTS
+#define ENABLE_TTS 1
 #endif
 #if !ENABLE_I2S_MIC
 #undef ENABLE_TTS
@@ -34,16 +34,35 @@
 #endif
 #ifndef MIC_MAX_RECORD_SECONDS
 // 愈短上傳愈快、雲端 STT 愈快（辨識品質略降）；可改 2
-#define MIC_MAX_RECORD_SECONDS 10
+#define MIC_MAX_RECORD_SECONDS 60
 #endif
 // 等 STT HTTP 回應：雲端用 OpenAI 時通常 <1 分鐘；若仍用 Poe 請改大（例如 360）
 #ifndef STT_HTTP_READ_TIMEOUT_SEC
 #define STT_HTTP_READ_TIMEOUT_SEC 120
 #endif
 
+// 與 esp32_voice_ai_robot.ino 相同：錄音寫入 SD_MMC /rec.wav，再上傳 STT（省 RAM；失敗則回退 RAM）
+#ifndef ENABLE_SD_MIC_RECORD
+#define ENABLE_SD_MIC_RECORD 1
+#endif
+// Freenove ESP32-S3 WROOM 內建 SD 1-bit：CLK=39 CMD=38 D0=40（依你的板子可改）
+
+#ifndef SD_MMC_CLK_PIN
+#define SD_MMC_CLK_PIN 39
+#endif
+#ifndef SD_MMC_CMD_PIN
+#define SD_MMC_CMD_PIN 38
+#endif
+#ifndef SD_MMC_D0_PIN
+#define SD_MMC_D0_PIN 40
+#endif
+
 #if ENABLE_I2S_MIC
 #include <ESP_I2S.h>
 #include "esp_heap_caps.h"
+#if ENABLE_SD_MIC_RECORD
+#include <SD_MMC.h>
+#endif
 #endif
 
 #if __has_include("wifi_secrets.h")
@@ -85,10 +104,49 @@
 #endif
 
 #if ENABLE_I2S_MIC
-static const int PIN_BCLK = 14;
-static const int PIN_WS = 13;
-static const int PIN_DOUT = 11;
-static const int PIN_DIN = 12;
+/*
+ * I2S：麥克風與喇叭各用一組線（預設不並接 BCLK/WS）。
+ *
+ * 預設接線（INMP441 + MAX98357A 類模組）：
+ *   麥克風  SCK/BCLK -> GPIO14   WS/LRCK -> GPIO13   SD/DOUT -> GPIO12   3.3V / GND / L/R 依模組
+ *   喇叭    BCLK     -> GPIO17   LRC/WS  -> GPIO18   DIN       -> GPIO11   VIN/GND、Speaker± 依模組
+ *
+ * 若要改回「喇叭與麥並接同一組 BCLK/WS」（省兩條線），在 wifi_secrets.h 設：
+ *   #define PIN_SPK_BCLK PIN_MIC_BCLK
+ *   #define PIN_SPK_WS   PIN_MIC_WS
+ */
+#ifndef PIN_MIC_BCLK
+#define PIN_MIC_BCLK 14
+#endif
+#ifndef PIN_MIC_WS
+#define PIN_MIC_WS 13
+#endif
+#ifndef PIN_MIC_DIN
+#define PIN_MIC_DIN 12
+#endif
+// 僅錄音時若驅動器要求 DOUT 腳位，可設未使用 GPIO；-1 表示不綁定（依 Arduino-ESP32 版本）
+#ifndef PIN_MIC_DOUT_UNUSED
+#define PIN_MIC_DOUT_UNUSED (-1)
+#endif
+
+#ifndef PIN_SPK_DOUT
+#define PIN_SPK_DOUT 11
+#endif
+#ifndef PIN_SPK_BCLK
+#define PIN_SPK_BCLK 17
+#endif
+#ifndef PIN_SPK_WS
+#define PIN_SPK_WS 18
+#endif
+
+// MAX98357A 的 SD（關機）：接到 ESP GPIO 後，錄音前關功放可減少「沙沙聲」。-1=未接（跳過）
+#ifndef PIN_AMP_SD
+#define PIN_AMP_SD (-1)
+#endif
+// 1：HIGH=功放開、LOW=關（多數小板）；若你的模組相反，改為 0
+#ifndef AMP_SD_ACTIVE_HIGH
+#define AMP_SD_ACTIVE_HIGH 1
+#endif
 
 static const uint32_t SAMPLE_RATE = 16000;
 static const uint16_t BITS_PER_SAMPLE = 16;
@@ -106,6 +164,25 @@ static uint32_t g_pcmDataBytes = 0;
 static uint32_t g_recStartMs = 0;
 static uint32_t g_recMaxMs = 0;
 static String g_serialLineBuf;
+#if ENABLE_SD_MIC_RECORD
+static bool g_recSourceSd = false;
+static File g_sdRecFile;
+static size_t g_sdPcmBytes = 0;
+static size_t g_recMaxPcmBytes = 0;
+static const char* kRecWavPath = "/rec.wav";
+#endif
+
+#if (PIN_AMP_SD >= 0)
+static void ampMuteForRecording() {
+  digitalWrite((uint8_t)PIN_AMP_SD, AMP_SD_ACTIVE_HIGH ? LOW : HIGH);
+}
+static void ampUnmuteForPlayback() {
+  digitalWrite((uint8_t)PIN_AMP_SD, AMP_SD_ACTIVE_HIGH ? HIGH : LOW);
+}
+#else
+static void ampMuteForRecording() {}
+static void ampUnmuteForPlayback() {}
+#endif
 #endif
 
 static WiFiUDP g_udp;
@@ -1109,13 +1186,79 @@ static void writeWavHeader(uint8_t* dst, uint32_t dataBytes) {
 
 static bool i2sBeginForMic() {
   I2S.end();
-  I2S.setPins(PIN_BCLK, PIN_WS, PIN_DOUT, PIN_DIN);
+  I2S.setPins(PIN_MIC_BCLK, PIN_MIC_WS, PIN_MIC_DOUT_UNUSED, PIN_MIC_DIN);
   return I2S.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
 }
+
+#if ENABLE_SD_MIC_RECORD
+static bool sdInitForMic() {
+  static bool inited = false;
+  if (inited) return true;
+  SD_MMC.setPins(SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN);
+  if (!SD_MMC.begin("/sdcard", true, true, SDMMC_FREQ_DEFAULT, 5)) {
+    Serial.println("[SD] SD_MMC.begin failed（將改用 RAM 錄音）");
+    return false;
+  }
+  Serial.print("[SD] OK, cardSize MB=");
+  Serial.println((unsigned long)(SD_MMC.cardSize() / (1024UL * 1024UL)));
+  inited = true;
+  return true;
+}
+
+static bool recStartSdRecording() {
+  if (g_sdRecFile) {
+    g_sdRecFile.close();
+  }
+  g_sdPcmBytes = 0;
+  ampMuteForRecording();
+  if (!i2sBeginForMic()) {
+    Serial.println("[REC] I2S 開始失敗");
+    ampUnmuteForPlayback();
+    return false;
+  }
+  if (SD_MMC.exists(kRecWavPath)) {
+    SD_MMC.remove(kRecWavPath);
+  }
+  g_sdRecFile = SD_MMC.open(kRecWavPath, FILE_WRITE);
+  if (!g_sdRecFile) {
+    Serial.println("[SD] open rec.wav for write failed");
+    I2S.end();
+    ampUnmuteForPlayback();
+    return false;
+  }
+  uint8_t hdr[44];
+  writeWavHeader(hdr, 0);
+  g_sdRecFile.write(hdr, sizeof(hdr));
+  return true;
+}
+
+static bool recStopFinalizeSd(size_t& outTotalBytes) {
+  outTotalBytes = 0;
+  if (!g_sdRecFile) return false;
+  uint8_t hdr[44];
+  writeWavHeader(hdr, (uint32_t)g_sdPcmBytes);
+  g_sdRecFile.seek(0);
+  g_sdRecFile.write(hdr, sizeof(hdr));
+  g_sdRecFile.flush();
+  g_sdRecFile.close();
+  outTotalBytes = 44 + g_sdPcmBytes;
+  return true;
+}
+#endif
 
 static void recFreeAbort() {
   g_recording = false;
   I2S.end();
+  ampUnmuteForPlayback();
+#if ENABLE_SD_MIC_RECORD
+  if (g_recSourceSd) {
+    if (g_sdRecFile) {
+      g_sdRecFile.close();
+    }
+    g_recSourceSd = false;
+    g_sdPcmBytes = 0;
+  }
+#endif
   if (g_wavBuf) {
     free(g_wavBuf);
     g_wavBuf = nullptr;
@@ -1173,6 +1316,23 @@ static bool recTryStart() {
   if (wantSec < 1) wantSec = 1;
   if (wantSec > 60) wantSec = 60;
 
+#if ENABLE_SD_MIC_RECORD
+  g_recSourceSd = false;
+  if (sdInitForMic() && recStartSdRecording()) {
+    g_recording = true;
+    g_recSourceSd = true;
+    g_recStartMs = millis();
+    g_recMaxMs = (uint32_t)wantSec * 1000UL;
+    g_recMaxPcmBytes = (size_t)SAMPLE_RATE * (uint32_t)wantSec * sizeof(int16_t);
+    g_sdPcmBytes = 0;
+    g_serialLineBuf = "";
+    delay(200);
+    Serial.println("[REC] SD 錄音中… 再輸入 r + Enter 停止並上傳（或達最長時間自動停止）");
+    return true;
+  }
+  Serial.println("[REC] SD 不可用，改用 RAM 緩衝錄音");
+#endif
+
   g_wavBuf = nullptr;
   g_wavCap = 0;
   int gotSec = 0;
@@ -1203,8 +1363,10 @@ static bool recTryStart() {
   g_recMaxMs = (uint32_t)gotSec * 1000UL;
   g_pcmDataBytes = 0;
   writeWavHeader(g_wavBuf, 0);
+  ampMuteForRecording();
   if (!i2sBeginForMic()) {
     Serial.println("[REC] I2S 開始失敗");
+    ampUnmuteForPlayback();
     free(g_wavBuf);
     g_wavBuf = nullptr;
     g_wavCap = 0;
@@ -1219,7 +1381,37 @@ static bool recTryStart() {
 }
 
 static void recPump() {
-  if (!g_recording || !g_wavBuf) return;
+  if (!g_recording) return;
+#if ENABLE_SD_MIC_RECORD
+  if (g_recSourceSd) {
+    if (!g_sdRecFile) return;
+    int32_t tmp[REC_CHUNK_FRAMES * 2];
+    size_t spacePcm = g_recMaxPcmBytes - g_sdPcmBytes;
+    size_t maxSamples = spacePcm / sizeof(int16_t);
+    size_t chunk = maxSamples < REC_CHUNK_FRAMES ? maxSamples : REC_CHUNK_FRAMES;
+    if (chunk == 0) return;
+    size_t got = I2S.readBytes((char*)tmp, chunk * sizeof(int32_t) * 2);
+    if (!got) return;
+    size_t frames = got / (sizeof(int32_t) * 2);
+    int16_t out16[REC_CHUNK_FRAMES];
+    size_t outN = 0;
+    for (size_t i = 0; i < frames; i++) {
+      if (g_sdPcmBytes + (outN + 1) * sizeof(int16_t) > g_recMaxPcmBytes) break;
+      int32_t l = tmp[i * 2 + 0];
+      int32_t r = tmp[i * 2 + 1];
+      int32_t s32 = g_micUseRight ? r : l;
+      int32_t v = s32 >> g_recShift;
+      if (v > 32767) v = 32767;
+      if (v < -32768) v = -32768;
+      out16[outN++] = (int16_t)v;
+    }
+    size_t wantBytes = outN * sizeof(int16_t);
+    size_t w = g_sdRecFile.write((uint8_t*)out16, wantBytes);
+    g_sdPcmBytes += w;
+    return;
+  }
+#endif
+  if (!g_wavBuf) return;
   size_t maxPcm = g_wavCap - 44;
   if (g_pcmDataBytes >= maxPcm) return;
 
@@ -1271,27 +1463,38 @@ static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
   outText = "";
   if (!g_run_wifi) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setHandshakeTimeout(30);
-  HTTPClient http;
-  // 必須 >= http.setTimeout：否則等待 STT 回應時會先被底層 TCP read 截斷（HTTP -11）
-  client.setTimeout(STT_HTTP_READ_TIMEOUT_SEC);
-  if (!http.begin(client, STT_URL)) return false;
-  http.setReuse(false);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("Content-Type", "audio/wav");
-  http.setTimeout((uint32_t)STT_HTTP_READ_TIMEOUT_SEC * 1000u);
-  int code = http.POST((uint8_t*)wav, wavLen);
-  String resp = http.getString();
-  http.end();
-  if (code != 200) {
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(30);
+    HTTPClient http;
+    // 必須 >= http.setTimeout：否則等待 STT 回應時會先被底層 TCP read 截斷（HTTP -11）
+    client.setTimeout(STT_HTTP_READ_TIMEOUT_SEC);
+    if (!http.begin(client, STT_URL)) {
+      if (attempt < 3) {
+        delay(400 * attempt);
+        continue;
+      }
+      return false;
+    }
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.addHeader("Content-Type", "audio/wav");
+    http.setTimeout((uint32_t)STT_HTTP_READ_TIMEOUT_SEC * 1000u);
+    int code = http.POST((uint8_t*)wav, wavLen);
+    String resp = http.getString();
+    http.end();
+    if (code == 200) {
+      outText = extractJsonStringField(resp, "text");
+      return outText.length() > 0;
+    }
     Serial.print("[STT HTTP ");
     Serial.print(code);
     Serial.println("]");
     if (code < 0) {
       Serial.print("[STT ERR] ");
-      Serial.println(http.errorToString(code));
+      Serial.println(HTTPClient::errorToString(code));
       Serial.print("[STT URL] ");
       Serial.println(STT_URL);
       Serial.print("[WiFi] RSSI=");
@@ -1300,23 +1503,148 @@ static bool httpPostStt(const uint8_t* wav, size_t wavLen, String& outText) {
       Serial.println(ESP.getFreeHeap());
     }
     Serial.println(resp);
-    return false;
+    if (attempt < 3) {
+      Serial.print("[STT] retry ");
+      Serial.print(attempt + 1);
+      Serial.println("/3…");
+      delay(600 * attempt);
+    }
   }
-  outText = extractJsonStringField(resp, "text");
-  return outText.length() > 0;
+  return false;
 }
+
+#if ENABLE_SD_MIC_RECORD
+static bool httpPostSttFromFile(const char* wavPath, String& outText) {
+  outText = "";
+  if (!g_run_wifi) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!sdInitForMic()) return false;
+
+  size_t wavLen = 0;
+  {
+    File f = SD_MMC.open(wavPath, FILE_READ);
+    if (!f) {
+      Serial.println("[SD] open wav for STT failed");
+      return false;
+    }
+    wavLen = (size_t)f.size();
+    f.close();
+  }
+  if (wavLen < 44) return false;
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    File f = SD_MMC.open(wavPath, FILE_READ);
+    if (!f) {
+      Serial.println("[SD] open wav for STT failed");
+      return false;
+    }
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(30);
+    client.setTimeout(STT_HTTP_READ_TIMEOUT_SEC);
+    HTTPClient http;
+    if (!http.begin(client, STT_URL)) {
+      f.close();
+      if (attempt < 3) {
+        delay(400 * attempt);
+        continue;
+      }
+      return false;
+    }
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.addHeader("Content-Type", "audio/wav");
+    http.setTimeout((uint32_t)STT_HTTP_READ_TIMEOUT_SEC * 1000u);
+    f.seek(0);
+    int code = http.sendRequest("POST", &f, wavLen);
+    String resp = http.getString();
+    http.end();
+    f.close();
+    if (code == 200) {
+      outText = extractJsonStringField(resp, "text");
+      return outText.length() > 0;
+    }
+    Serial.print("[STT HTTP ");
+    Serial.print(code);
+    Serial.println("]");
+    if (code < 0) {
+      Serial.print("[STT ERR] ");
+      Serial.println(HTTPClient::errorToString(code));
+      Serial.print("[STT URL] ");
+      Serial.println(STT_URL);
+      Serial.print("[WiFi] RSSI=");
+      Serial.println(WiFi.RSSI());
+    }
+    Serial.println(resp);
+    if (attempt < 3) {
+      Serial.print("[STT] retry ");
+      Serial.print(attempt + 1);
+      Serial.println("/3…");
+      delay(600 * attempt);
+    }
+  }
+  return false;
+}
+#endif
 
 static void processUserTextLine(const String& line);
 
 static void micFinishAndUpload() {
   g_recording = false;
   g_recMaxMs = 0;
+  ampUnmuteForPlayback();
+  const uint32_t minBytes = (uint32_t)(SAMPLE_RATE / 2) * (uint32_t)sizeof(int16_t);
+
+#if ENABLE_SD_MIC_RECORD
+  if (g_recSourceSd) {
+    I2S.end();
+    if (g_sdPcmBytes < minBytes) {
+      Serial.println("[REC] 錄音太短，已取消");
+      if (g_sdRecFile) {
+        g_sdRecFile.close();
+      }
+      if (SD_MMC.exists(kRecWavPath)) {
+        SD_MMC.remove(kRecWavPath);
+      }
+      g_recSourceSd = false;
+      g_sdPcmBytes = 0;
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    size_t totalBytes = 0;
+    if (!recStopFinalizeSd(totalBytes)) {
+      Serial.println("[REC] SD 寫入 WAV 失敗");
+      g_recSourceSd = false;
+      g_sdPcmBytes = 0;
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    g_recSourceSd = false;
+    g_sdPcmBytes = 0;
+    String said;
+    if (!httpPostSttFromFile(kRecWavPath, said)) {
+      Serial.println("[REC] STT 失敗（檢查 STT_URL、WiFi、後端金鑰）");
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    said.trim();
+    if (said.length() == 0) {
+      Serial.println("[REC] 辨識為空");
+      Serial.println("請繼續輸入：");
+      return;
+    }
+    Serial.print("[YOU voice] ");
+    Serial.println(said);
+    processUserTextLine(said);
+    return;
+  }
+#endif
+
   I2S.end();
   if (!g_wavBuf) {
     g_pcmDataBytes = 0;
     return;
   }
-  const uint32_t minBytes = (uint32_t)(SAMPLE_RATE / 2) * (uint32_t)sizeof(int16_t);
   if (g_pcmDataBytes < minBytes) {
     Serial.println("[REC] 錄音太短，已取消");
     free(g_wavBuf);
@@ -1392,8 +1720,37 @@ static bool httpPostTts(const String& text, String& outAbsoluteUrl) {
   return outAbsoluteUrl.length() > 0;
 }
 
-static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
+// 與 esp32_serial_chat_tts.ino 相同：避免一次 malloc 整個 Content-Length、SPIRAM 與 realloc 混用出錯
+static uint8_t* ttsBufAlloc(size_t sz, bool& useSpiRam) {
+  uint8_t* p = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) {
+    useSpiRam = true;
+    return p;
+  }
+  useSpiRam = false;
+  return (uint8_t*)malloc(sz);
+}
+
+static uint8_t* ttsBufRealloc(uint8_t* p, size_t newSz, bool useSpiRam) {
+  if (useSpiRam) {
+    return (uint8_t*)heap_caps_realloc(p, newSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  return (uint8_t*)realloc(p, newSz);
+}
+
+static void ttsBufFree(uint8_t* p, bool useSpiRam) {
+  if (!p) return;
+  if (useSpiRam) {
+    heap_caps_free(p);
+  } else {
+    free(p);
+  }
+}
+
+// outSpiRam：若非 nullptr，回傳緩衝區是否在 PSRAM（須用 ttsBufFree 釋放）
+static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize, bool* outSpiRam = nullptr) {
   outSize = 0;
+  if (outSpiRam) *outSpiRam = false;
   if (!g_run_wifi || WiFi.status() != WL_CONNECTED) return nullptr;
   WiFiClientSecure client;
   client.setInsecure();
@@ -1411,14 +1768,19 @@ static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
   int len = http.getSize();
   const size_t kMax = 512 * 1024;
   WiFiClient* stream = http.getStreamPtr();
-  size_t cap = (len > 0) ? (size_t)len : (64 * 1024);
+  const size_t kFirstChunk = 64 * 1024;
+  size_t cap = (len > 0) ? (size_t)len : kFirstChunk;
   if (cap > kMax) cap = kMax;
-  uint8_t* buf = nullptr;
-  if (ESP.getPsramSize() > 0) {
-    buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  }
-  if (!buf) buf = (uint8_t*)malloc(cap);
+  if (len > 0 && cap > kFirstChunk) cap = kFirstChunk;
+
+  bool useSpiRam = false;
+  uint8_t* buf = ttsBufAlloc(cap, useSpiRam);
   if (!buf) {
+    Serial.println("[TTS] malloc failed（MP3 緩衝）");
+    Serial.print("[HEAP] free=");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" largest=");
+    Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     http.end();
     return nullptr;
   }
@@ -1432,13 +1794,14 @@ static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
         size_t newCap = cap * 2;
         if (newCap < pos + toRead) newCap = pos + toRead;
         if (newCap > kMax) {
-          free(buf);
+          ttsBufFree(buf, useSpiRam);
           http.end();
           return nullptr;
         }
-        uint8_t* nb = (uint8_t*)realloc(buf, newCap);
+        uint8_t* nb = ttsBufRealloc(buf, newCap, useSpiRam);
         if (!nb) {
-          free(buf);
+          Serial.println("[TTS] realloc failed（MP3）");
+          ttsBufFree(buf, useSpiRam);
           http.end();
           return nullptr;
         }
@@ -1455,12 +1818,13 @@ static uint8_t* downloadMp3ToRam(const char* url, size_t& outSize) {
   }
   http.end();
   outSize = pos;
+  if (outSpiRam) *outSpiRam = useSpiRam;
   return buf;
 }
 
 static bool i2sBeginForPlayback() {
   I2S.end();
-  I2S.setPins(PIN_BCLK, PIN_WS, PIN_DOUT, -1, -1);
+  I2S.setPins(PIN_SPK_BCLK, PIN_SPK_WS, PIN_SPK_DOUT, -1, -1);
   return I2S.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
 }
 
@@ -1468,6 +1832,7 @@ static void speakAiReply(const String& replyText, const String& inlineTtsUrl) {
   String t = stripForTts(replyText);
   if (!t.length()) return;
 
+  ampUnmuteForPlayback();
   Serial.println("[TTS] 播放 AI 回覆…");
   I2S.end();
   delay(50);
@@ -1483,17 +1848,18 @@ static void speakAiReply(const String& replyText, const String& inlineTtsUrl) {
   }
 
   size_t mp3Len = 0;
-  uint8_t* mp3 = downloadMp3ToRam(mp3Url.c_str(), mp3Len);
+  bool mp3Spi = false;
+  uint8_t* mp3 = downloadMp3ToRam(mp3Url.c_str(), mp3Len, &mp3Spi);
   if (!mp3 || mp3Len < 16) {
     Serial.println("[TTS] MP3 下載失敗");
-    if (mp3) free(mp3);
+    if (mp3) ttsBufFree(mp3, mp3Spi);
     i2sBeginForMic();
     return;
   }
 
   if (!i2sBeginForPlayback()) {
     Serial.println("[TTS] I2S 播放模式啟動失敗");
-    free(mp3);
+    ttsBufFree(mp3, mp3Spi);
     i2sBeginForMic();
     return;
   }
@@ -1501,7 +1867,7 @@ static void speakAiReply(const String& replyText, const String& inlineTtsUrl) {
   bool ok = I2S.playMP3(mp3, mp3Len);
   Serial.print("[TTS] playMP3=");
   Serial.println(ok ? "ok" : "fail");
-  free(mp3);
+  ttsBufFree(mp3, mp3Spi);
   i2sBeginForMic();
 }
 #endif
@@ -1527,10 +1893,21 @@ void setup() {
   Serial.println((unsigned)S3_PC_CMD_UDP_PORT);
 #if ENABLE_I2S_MIC
   Serial.println("輸入 r 開始錄音，再輸入 r 停止並上傳 STT（需要 WiFi）");
+#if ENABLE_SD_MIC_RECORD
+  Serial.println("錄音：優先 SD_MMC /rec.wav（與 esp32_voice_ai_robot）；失敗則用 RAM");
+#endif
 #if ENABLE_TTS
   Serial.println("TTS：AI 回覆後會播 MP3（需要 WiFi）");
+#else
+  Serial.println("[CFG] ENABLE_TTS=0：僅 Serial 顯示 AI 文字，不播喇叭；要播 TTS 請設 ENABLE_TTS 1");
 #endif
   Serial.println("micL/micR、shift8..shift20");
+#if (PIN_AMP_SD >= 0)
+  pinMode(PIN_AMP_SD, OUTPUT);
+  ampUnmuteForPlayback();
+  Serial.print("[CFG] MAX98357 SD（功放開關）<- GPIO ");
+  Serial.println(PIN_AMP_SD);
+#endif
 #endif
 
 #if ENABLE_BLE_CLIENT
@@ -1840,10 +2217,21 @@ void loop() {
 #if ENABLE_I2S_MIC
   if (g_recording) {
     recPump();
-    if (g_wavBuf && g_pcmDataBytes >= g_wavCap - 44) {
-      Serial.println("[REC] 緩衝已滿，停止並上傳");
-      micFinishAndUpload();
-      return;
+#if ENABLE_SD_MIC_RECORD
+    if (g_recSourceSd) {
+      if (g_sdPcmBytes >= g_recMaxPcmBytes) {
+        Serial.println("[REC] 緩衝已滿，停止並上傳");
+        micFinishAndUpload();
+        return;
+      }
+    } else
+#endif
+    {
+      if (g_wavBuf && g_pcmDataBytes >= g_wavCap - 44) {
+        Serial.println("[REC] 緩衝已滿，停止並上傳");
+        micFinishAndUpload();
+        return;
+      }
     }
     if (g_recMaxMs > 0 && millis() - g_recStartMs >= g_recMaxMs) {
       Serial.println("[REC] 已達最長錄音時間，自動停止並上傳");

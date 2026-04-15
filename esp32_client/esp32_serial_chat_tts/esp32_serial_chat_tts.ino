@@ -20,6 +20,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ESP_I2S.h>
+#include "esp_heap_caps.h"
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -51,6 +52,75 @@ static String escapeJsonString(const String& s) {
   return o;
 }
 
+static int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+// 將 Unicode codepoint 轉成 UTF-8 加到 out
+static void appendUtf8(String& out, uint32_t cp) {
+  if (cp <= 0x7F) {
+    out += (char)cp;
+  } else if (cp <= 0x7FF) {
+    out += (char)(0xC0 | ((cp >> 6) & 0x1F));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else if (cp <= 0xFFFF) {
+    out += (char)(0xE0 | ((cp >> 12) & 0x0F));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else {
+    out += (char)(0xF0 | ((cp >> 18) & 0x07));
+    out += (char)(0x80 | ((cp >> 12) & 0x3F));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  }
+}
+
+// 解析 JSON 字串內的跳脫：\\n \\t \\\" \\\\ 以及 \\uXXXX（含 surrogate pair）
+static bool consumeJsonEscape(const String& json, unsigned& i, String& out) {
+  if (i >= json.length()) return false;
+  char n = json[i];
+  if (n == 'n') { out += '\n'; i++; return true; }
+  if (n == 't') { out += '\t'; i++; return true; }
+  if (n == 'r') { /* ignore */ i++; return true; }
+  if (n == '"' ) { out += '"'; i++; return true; }
+  if (n == '\\') { out += '\\'; i++; return true; }
+  if (n != 'u') { out += n; i++; return true; }
+
+  // \\uXXXX
+  if (i + 4 >= json.length()) return false;
+  uint32_t u1 = 0;
+  for (int k = 0; k < 4; k++) {
+    int v = hexVal(json[i + 1 + k]);
+    if (v < 0) return false;
+    u1 = (u1 << 4) | (uint32_t)v;
+  }
+  i += 5; // consume 'u' + 4 hex
+
+  // surrogate pair?
+  if (u1 >= 0xD800 && u1 <= 0xDBFF) {
+    if (i + 5 < json.length() && json[i] == '\\' && json[i + 1] == 'u') {
+      uint32_t u2 = 0;
+      for (int k = 0; k < 4; k++) {
+        int v = hexVal(json[i + 2 + k]);
+        if (v < 0) { appendUtf8(out, u1); return true; }
+        u2 = (u2 << 4) | (uint32_t)v;
+      }
+      if (u2 >= 0xDC00 && u2 <= 0xDFFF) {
+        uint32_t cp = 0x10000 + (((u1 - 0xD800) << 10) | (u2 - 0xDC00));
+        appendUtf8(out, cp);
+        i += 6; // consume \\uXXXX
+        return true;
+      }
+    }
+  }
+
+  appendUtf8(out, u1);
+  return true;
+}
+
 static String extractJsonStringField(const String& json, const char* field) {
   String key = "\"";
   key += field;
@@ -59,19 +129,14 @@ static String extractJsonStringField(const String& json, const char* field) {
   if (k < 0) return "";
   int colon = json.indexOf(':', k);
   if (colon < 0) return "";
-  int q1 = json.indexOf('"', colon + 1);
-  if (q1 < 0) return "";
-
+  int q = json.indexOf('"', colon + 1);
+  if (q < 0) return "";
   String out;
-  for (unsigned i = (unsigned)q1 + 1; i < json.length(); ) {
+  for (unsigned i = (unsigned)q + 1; i < json.length(); ) {
     char c = json[i];
     if (c == '\\' && i + 1 < json.length()) {
-      char n = json[i + 1];
-      if (n == 'n') { out += '\n'; i += 2; continue; }
-      if (n == 't') { out += '\t'; i += 2; continue; }
-      if (n == 'r') { i += 2; continue; }
-      out += n;
-      i += 2;
+      i++; // move to escape type
+      if (!consumeJsonEscape(json, i, out)) break;
       continue;
     }
     if (c == '"') break;
@@ -81,8 +146,36 @@ static String extractJsonStringField(const String& json, const char* field) {
   return out;
 }
 
-static uint8_t* downloadToRam(const char* url, size_t& outSize) {
+static uint8_t* bufAlloc(size_t sz, bool& useSpiRam) {
+  uint8_t* p = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p) {
+    useSpiRam = true;
+    return p;
+  }
+  useSpiRam = false;
+  return (uint8_t*)malloc(sz);
+}
+
+static uint8_t* bufRealloc(uint8_t* p, size_t newSz, bool useSpiRam) {
+  if (useSpiRam) {
+    return (uint8_t*)heap_caps_realloc(p, newSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  return (uint8_t*)realloc(p, newSz);
+}
+
+static void bufFree(uint8_t* p, bool useSpiRam) {
+  if (!p) return;
+  if (useSpiRam) {
+    heap_caps_free(p);
+  } else {
+    free(p);
+  }
+}
+
+// outSpiRam: 若非 nullptr，回傳緩衝區是否位於 PSRAM（釋放時需對應 bufFree）
+static uint8_t* downloadToRam(const char* url, size_t& outSize, bool* outSpiRam = nullptr) {
   outSize = 0;
+  if (outSpiRam) *outSpiRam = false;
   WiFiClientSecure client;
   client.setInsecure();
 
@@ -103,12 +196,20 @@ static uint8_t* downloadToRam(const char* url, size_t& outSize) {
   int len = http.getSize();
   const size_t kMax = 512 * 1024;
   WiFiClient* stream = http.getStreamPtr();
-  size_t cap = (len > 0) ? (size_t)len : (64 * 1024);
+  // 不要一次 malloc 整個 Content-Length（內部 SRAM 常無大連續區塊）；優先 PSRAM
+  const size_t kFirstChunk = 64 * 1024;
+  size_t cap = (len > 0) ? (size_t)len : kFirstChunk;
   if (cap > kMax) cap = kMax;
+  if (len > 0 && cap > kFirstChunk) cap = kFirstChunk;
 
-  uint8_t* buf = (uint8_t*)malloc(cap);
+  bool useSpiRam = false;
+  uint8_t* buf = bufAlloc(cap, useSpiRam);
   if (!buf) {
     Serial.println("[ERR] malloc failed");
+    Serial.print("[HEAP] free=");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" largest=");
+    Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     http.end();
     return nullptr;
   }
@@ -124,14 +225,14 @@ static uint8_t* downloadToRam(const char* url, size_t& outSize) {
         if (newCap < pos + toRead) newCap = pos + toRead;
         if (newCap > kMax) {
           Serial.println("[ERR] file too large");
-          free(buf);
+          bufFree(buf, useSpiRam);
           http.end();
           return nullptr;
         }
-        uint8_t* nb = (uint8_t*)realloc(buf, newCap);
+        uint8_t* nb = bufRealloc(buf, newCap, useSpiRam);
         if (!nb) {
           Serial.println("[ERR] realloc failed");
-          free(buf);
+          bufFree(buf, useSpiRam);
           http.end();
           return nullptr;
         }
@@ -148,6 +249,7 @@ static uint8_t* downloadToRam(const char* url, size_t& outSize) {
   }
   http.end();
   outSize = pos;
+  if (outSpiRam) *outSpiRam = useSpiRam;
   return buf;
 }
 
@@ -232,10 +334,11 @@ static bool playTtsFromText(const String& text) {
   Serial.println(url);
 
   size_t mp3Len = 0;
-  uint8_t* mp3 = downloadToRam(url.c_str(), mp3Len);
+  bool mp3Spi = false;
+  uint8_t* mp3 = downloadToRam(url.c_str(), mp3Len, &mp3Spi);
   if (!mp3 || mp3Len < 16) {
     Serial.println("[ERR] mp3 download failed");
-    if (mp3) free(mp3);
+    if (mp3) bufFree(mp3, mp3Spi);
     return false;
   }
   Serial.print("[OK] mp3 bytes=");
@@ -244,7 +347,7 @@ static bool playTtsFromText(const String& text) {
   bool ok = I2S.playMP3(mp3, mp3Len);
   Serial.print("playMP3 ok=");
   Serial.println(ok ? "true" : "false");
-  free(mp3);
+  bufFree(mp3, mp3Spi);
   return ok;
 }
 

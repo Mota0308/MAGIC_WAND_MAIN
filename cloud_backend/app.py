@@ -856,6 +856,93 @@ def _poe_take_from_first_cjk_or_kana(text: str) -> str:
     return text[m.start() :].strip()
 
 
+def _has_cjk_or_kana(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"[\u3040-\u30ff\u4e00-\u9fff\u3400-\u4dbf]", text))
+
+
+def _extract_cjk_lines(text: str) -> str:
+    """Keep only lines that contain CJK or kana (drops English-only reasoning blocks)."""
+    if not text:
+        return ""
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if re.search(r"[\u3040-\u30ff\u4e00-\u9fff\u3400-\u4dbf]", s):
+            out.append(s)
+    return "\n".join(out).strip()
+
+
+def _strip_poe_reasoning_noise(text: str) -> str:
+    """
+    Poe may return chain-of-thought / markdown instead of a transcript (especially wrong bot).
+    Remove blockquotes, markdown headings, and common English meta lines.
+    """
+    if not text:
+        return ""
+    kept = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith(">") or s.startswith("#"):
+            continue
+        if re.match(r"^\*+Thinking", s, re.I):
+            continue
+        low = s.lower()
+        if "thinking" in low and "*" in s and not _has_cjk_or_kana(s):
+            continue
+        if not _has_cjk_or_kana(s) and any(
+            x in low
+            for x in (
+                "i'm currently",
+                "i've shifted",
+                "i am now",
+                "refining transcription",
+                "analyzing user input",
+                "considering potential",
+                "my primary goal",
+                "per the instructions",
+                "without the audio",
+                "audio file",
+                "minimalist response",
+                "chain-of-thought",
+            )
+        ):
+            continue
+        kept.append(s)
+    return "\n".join(kept).strip()
+
+
+def _looks_like_poe_reasoning_only(text: str) -> bool:
+    """Heuristic: long English-only blob with reasoning markers, no transcript."""
+    if not text or len(text) < 120:
+        return False
+    if _has_cjk_or_kana(text):
+        return False
+    low = text.lower()
+    hits = sum(
+        1
+        for m in (
+            "thinking",
+            "refining",
+            "analyzing",
+            "considering",
+            "contemplating",
+            "i'm ",
+            "i've ",
+            "primary goal",
+            "without the audio",
+            "transcription capabilities",
+        )
+        if m in low
+    )
+    return hits >= 3
+
+
 def _poe_stt_wav(wav_bytes: bytes) -> str:
     """
     Call Poe bot (e.g. Whisper-V3-Large-T) via fastapi-poe with file upload.
@@ -881,10 +968,9 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
     msg = fp.ProtocolMessage(
         role="user",
         content=(
-            "請把這段音訊『逐字轉寫成繁體中文』，"
-            "不要翻譯成其他語言，也不要總結或改寫，只輸出聽到的內容本身，"
-            "不要輸出任何『Downloading / Transcribing / Cartesia』等狀態說明，"
-            "不要加任何說明或標註。"
+            "你是語音轉文字工具。請只輸出音訊中的話語內容（繁體中文），"
+            "逐字轉寫，不要翻譯、不要總結、不要改寫。"
+            "禁止輸出英文、禁止思考過程、禁止 Markdown、禁止任何說明。"
         ),
         attachments=[att],
     )
@@ -905,26 +991,46 @@ def _poe_stt_wav(wav_bytes: bytes) -> str:
     joined = "".join(str_parts).strip()
     if len(joined) > len(raw) * 1.2:
         raw = joined
-    text = _strip_poe_stt_status_noise(raw)
+
+    # 1) Prefer lines that actually contain Chinese/Japanese (drops English-only reasoning spam)
+    for blob in (raw, joined):
+        cjk = _extract_cjk_lines(blob)
+        if cjk:
+            return cjk
+
+    # 2) Strip status + reasoning noise, then CJK from first char
+    text = ""
+    for blob in (raw, joined):
+        t = _strip_poe_stt_status_noise(blob)
+        t = _strip_poe_reasoning_noise(t)
+        if t:
+            text = t
+            break
     if not text:
         text = _poe_take_from_first_cjk_or_kana(raw)
     if not text:
         text = _poe_take_from_first_cjk_or_kana(joined)
-    # Soft fallback: older deployments passed status strings through as "text" so STT never 502'd.
-    # If Poe truly returns only English status, chat may still be useless — fix POE_STT_MODEL in Railway.
-    if not text:
-        fallback = raw or joined
-        if fallback.strip():
-            print(
-                "[STT] Poe STT: no transcript after cleanup; using raw bot output (len=%d). "
-                "Consider POE_STT_MODEL=Whisper-V3-Large-T or STT_PROVIDER=openai."
-                % len(fallback)
-            )
-            return fallback.strip()
+
+    if text:
+        return text
+
+    # 3) Do not return raw English reasoning as "transcript"
+    fallback = (raw or joined or "").strip()
+    if fallback and _looks_like_poe_reasoning_only(fallback):
         raise ValueError(
-            "Poe STT returned empty response. Check POE_API_KEY, POE_STT_MODEL, and fastapi-poe."
+            "Poe STT returned reasoning text instead of a transcript. "
+            "Set Railway STT_PROVIDER=openai (Whisper) or set POE_STT_MODEL to a dedicated Whisper bot."
         )
-    return text
+    if fallback:
+        print(
+            "[STT] Poe STT: no CJK after cleanup; using raw (len=%d). "
+            "Prefer STT_PROVIDER=openai or POE_STT_MODEL=Whisper-V3-Large-T."
+            % len(fallback)
+        )
+        return fallback.strip()
+    raise ValueError(
+        "Poe STT returned empty response. Check POE_API_KEY, POE_STT_MODEL, and fastapi-poe."
+    )
 
 
 def _run_with_timeout(fn, timeout_sec: float):
